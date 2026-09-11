@@ -1,1 +1,1 @@
-ab vcasdfaf
+print("Aryan")
