@@ -1,0 +1,18 @@
+MAC
+
+cd /path/to/Focus-Guard
+source .venv/bin/activate
+uvicorn backend.main:app --reload
+
+cd /path/to/Focus-Guard/frontend
+npm run dev
+
+
+WINDOWS
+
+cd C:\path\to\Focus-Guard
+.venv\Scripts\activate
+uvicorn backend.main:app --reload
+
+cd C:\path\to\Focus-Guard\frontend
+npm run dev
