@@ -1,0 +1,1 @@
+"""Core session and attention domain logic."""

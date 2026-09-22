@@ -26,3 +26,15 @@ def test_focus_status_endpoint() -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "idle"
     assert response.json()["session_length_minutes"] == 25
+
+
+def test_session_lifecycle_and_attention_endpoints() -> None:
+    client = TestClient(app)
+    start = client.post("/sessions/start")
+    assert start.status_code == 200
+    assert start.json()["state"] == "running"
+    assert client.get("/attention").status_code == 200
+    assert client.post("/sessions/pause").json()["state"] == "paused"
+    assert client.post("/sessions/resume").json()["state"] == "running"
+    assert client.post("/sessions/end").json()["state"] == "completed"
+    assert client.get("/history").status_code == 200
