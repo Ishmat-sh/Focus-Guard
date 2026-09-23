@@ -16,3 +16,4 @@ uvicorn backend.main:app --reload
 
 cd C:\path\to\Focus-Guard\frontend
 npm run dev
+ok
