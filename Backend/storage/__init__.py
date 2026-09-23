@@ -1,0 +1,1 @@
+"""SQLite persistence for completed sessions and telemetry."""

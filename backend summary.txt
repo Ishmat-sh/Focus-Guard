@@ -1,0 +1,152 @@
+Focus Guard – Backend Milestone Summary
+
+Project structure:
+- backend/: main API and logic modules
+- frontend/: React dashboard
+- tests/: backend validation tests
+- requirements.txt: dependencies
+- pyproject.toml: project config
+
+Libraries used:
+- FastAPI: REST API framework for backend endpoints
+- Uvicorn: ASGI server to run the FastAPI app
+- Pytest: backend testing framework
+- HTTPX: used by FastAPI test client setup
+- NumPy: numerical helper operations
+- OpenCV (opencv-python): webcam capture and frame handling
+- MediaPipe: face landmark extraction and face mesh analysis
+- SQLite3: local database persistence
+- React + Vite: frontend dashboard
+- Tailwind CSS: frontend styling
+
+Milestone 1 — Project setup + architecture + environment
+- Created a clean modular structure with backend/, frontend/, tests/.
+- Installed Python dependencies for FastAPI, NumPy, OpenCV, MediaPipe, and pytest.
+- Set up the app architecture around the backend API, session logic, context detection, scoring engine, and database layer.
+- Verified project startup readiness by making sure the backend can run and the frontend can compile.
+
+Milestone 2 — Session Manager + stopwatch
+- Built SessionManager in backend/core/session.py.
+- Added states: IDLE → RUNNING → PAUSED → RUNNING → COMPLETED.
+- Included a stopwatch-like elapsed time tracker.
+- Supported start, pause, resume, and end actions.
+- Stored time using a monotonic clock so it is unit-testable and stable.
+
+Milestone 3 — Webcam capture + face detection
+- Created backend/vision/capture.py for camera opening and frame reading.
+- Created backend/vision/analyzer.py for face analysis.
+- Added camera availability checks and safe frame handling.
+- Implemented a FaceAnalyzer that tries to process frames with MediaPipe Face Mesh.
+- Detects whether a face is present or missing.
+
+Milestone 4 — Blink/EAR
+- Added eye aspect ratio (EAR) calculation logic.
+- Implemented blink detection based on thresholds.
+- Added helper functions to detect whether an eye is closed by comparing EAR against a threshold.
+- This creates the foundation for blink counting and frequency analysis.
+
+Milestone 5 — Head pose + basic gaze
+- Added helper functions for head pose estimation:
+  - forward
+  - left
+  - right
+  - up
+  - down
+- Added basic gaze approximation using eye ratios and directional positions.
+- Detects whether the user is looking at the screen or away.
+
+Milestone 6 — Basic posture
+- Added posture analysis using face height vs shoulder-distance logic.
+- Differentiates between upright and slouched posture.
+- This prepares the posture signal to feed into the overall attention score.
+
+Milestone 7 — macOS active application detection
+- Implemented backend/context/macos.py using AppleScript via osascript.
+- Reads the current frontmost application name on macOS.
+- This allows the app to know whether the user is in a work app, browser, etc.
+
+Milestone 8 — Windows active application detection
+- Implemented backend/context/windows.py using ctypes and Windows API calls.
+- Fetches the foreground window title/application name on Windows.
+- Returns "Unknown" on unsupported or failing environments.
+
+Milestone 9 — Application categorization
+- Created backend/context/categories.py.
+- Added categories:
+  - PRODUCTIVE
+  - NEUTRAL
+  - DISTRACTING
+  - UNKNOWN
+- Mapped app names such as VS Code, Terminal, YouTube, Discord, Safari, etc.
+- This allows the attention engine to judge whether the current app is helping or harming focus.
+
+Milestone 10 — Attention scoring engine
+- Created backend/core/scoring.py.
+- Built a rule-based scoring engine from 0 to 100.
+- Combined signals such as:
+  - face present / absent
+  - looking at screen / away
+  - posture
+  - app category
+  - blink rate
+- Score is clamped to valid range and returned as a structured result.
+
+Milestone 11 — Four attention states + temporal smoothing
+- Added attention states:
+  - FOCUSED
+  - DRIFTING
+  - DISTRACTED
+  - FATIGUED
+- Used smoothing with a deque to average recent score values.
+- Prevents noisy single-frame jumps from causing flickering state changes.
+- Makes state transitions more realistic and stable.
+
+Milestone 12 — Persistent distraction + alerts
+- Implemented backend/core/alerts.py.
+- Alert logic detects sustained distraction over time rather than brief distraction.
+- Includes cooldown to avoid repeated alert spam.
+- Stops resetting when the session is paused or ended.
+
+Milestone 13 — SQLite database
+- Created backend/storage/database.py.
+- Added SQLite tables for:
+  - sessions
+  - telemetry
+- Stores session metadata and time-based attention results.
+- Ensures no raw webcam frames are saved.
+- This gives the app persistent records for later analysis and history views.
+
+Milestone 14 — FastAPI integration
+- Wired everything into backend/main.py.
+- Added endpoints for:
+  - session start
+  - pause
+  - resume
+  - end
+  - current session status
+  - attention score
+  - metrics
+  - saved history
+- Added CORS support so the frontend can talk to the backend on localhost.
+- Exposed all logic through a clean REST API.
+
+How everything fits together:
+1. The session manager controls whether the user is active, paused, or ended.
+2. The webcam and MediaPipe layer detects face presence and landmarks.
+3. EAR, gaze, posture, and head pose helpers convert landmark data into behavioral signals.
+4. The app context detector finds the active application on macOS/Windows.
+5. The app categorizer labels it as productive, neutral, distracting, or unknown.
+6. The attention scorer combines all of these signals into a score from 0 to 100.
+7. The state logic smooths the score into FOCUSED/DRIFTING/DISTRACTED/FATIGUED.
+8. The alert manager fires only after sustained distraction and cooldown rules are satisfied.
+9. The SQLite database stores session and telemetry data.
+10. FastAPI exposes this data to the frontend dashboard.
+11. The frontend React app polls the backend and shows session time, state, score, app name, and history.
+
+Current status:
+- Core backend logic, scoring, alerts, persistent storage, app context, and API integration are implemented.
+- Webcam/live signal processing is partially structured and helper logic exists.
+- Full live camera-driven milestone verification still requires a real webcam environment to test on a machine with a camera available.
+
+Summary:
+This project now has a solid backend architecture for a focus-monitoring system: session tracking, real-time attention analysis, app detection, categorization, scoring, database persistence, and API integration. The main remaining step for full production behavior is connecting the live webcam pipeline end-to-end and validating it with actual camera data in a real environment.
