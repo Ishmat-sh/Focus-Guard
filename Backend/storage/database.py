@@ -10,6 +10,7 @@ class Database:
         self.path = str(path)
         self.connection = sqlite3.connect(self.path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS sessions (
@@ -28,7 +29,15 @@ class Database:
 
     def save_session(self, session: Any) -> None:
         self.connection.execute(
-            "INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?)",
+            """
+            INSERT INTO sessions (id, started_at, ended_at, elapsed_seconds, state)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                started_at = excluded.started_at,
+                ended_at = excluded.ended_at,
+                elapsed_seconds = excluded.elapsed_seconds,
+                state = excluded.state
+            """,
             (session.id, session.started_at, session.ended_at, session.elapsed_seconds, session.state.value),
         )
         self.connection.commit()
@@ -43,3 +52,7 @@ class Database:
     def history(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.connection.execute("SELECT * FROM sessions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
+
+    def next_session_id(self) -> int:
+        row = self.connection.execute("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM sessions").fetchone()
+        return int(row["next_id"])

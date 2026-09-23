@@ -25,15 +25,17 @@ class Session:
 
 
 class SessionManager:
-    def __init__(self, clock: Callable[[], float] = monotonic) -> None:
+    def __init__(self, clock: Callable[[], float] = monotonic, next_id: Callable[[], int] | None = None) -> None:
         self._clock = clock
+        self._next_id_provider = next_id
         self._next_id = 1
         self.current: Session | None = None
 
     def start(self) -> Session:
         if self.current and self.current.state in {SessionState.RUNNING, SessionState.PAUSED}:
             raise ValueError("A session is already active")
-        self.current = Session(self._next_id, SessionState.RUNNING, self._clock())
+        session_id = self._next_id_provider() if self._next_id_provider else self._next_id
+        self.current = Session(session_id, SessionState.RUNNING, self._clock())
         self._next_id += 1
         return self.current
 

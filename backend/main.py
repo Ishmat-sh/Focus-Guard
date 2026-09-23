@@ -19,10 +19,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-session_manager = SessionManager()
+database = Database()
+session_manager = SessionManager(next_id=database.next_session_id)
 scorer = AttentionScorer()
 alerts = AlertManager()
-database = Database()
 
 
 @app.get("/")
@@ -53,23 +53,23 @@ def start_session() -> dict[str, object]:
         session = session_manager.start()
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
+    database.save_session(session)
     return asdict(session) | {"state": session.state.value}
 
 
 @app.post("/sessions/pause")
 def pause_session() -> dict[str, object]:
-    return _session_action(session_manager.pause)
+    return _session_action(session_manager.pause, persist=True)
 
 
 @app.post("/sessions/resume")
 def resume_session() -> dict[str, object]:
-    return _session_action(session_manager.resume)
+    return _session_action(session_manager.resume, persist=True)
 
 
 @app.post("/sessions/end")
 def end_session() -> dict[str, object]:
-    result = _session_action(session_manager.end)
-    database.save_session(session_manager.current)
+    result = _session_action(session_manager.end, persist=True)
     alerts.reset()
     return result
 
@@ -103,9 +103,11 @@ def history() -> list[dict[str, object]]:
     return database.history()
 
 
-def _session_action(action) -> dict[str, object]:
+def _session_action(action, persist: bool = False) -> dict[str, object]:
     try:
         session = action()
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
+    if persist:
+        database.save_session(session)
     return asdict(session) | {"state": session.state.value}

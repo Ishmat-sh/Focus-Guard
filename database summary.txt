@@ -1,0 +1,47 @@
+Focus Guard - Database Summary
+
+Milestone 13: SQLite Database
+
+File:
+- backend/storage/database.py
+
+What was added:
+- SQLite database persistence using Python's built-in sqlite3 module.
+- sessions table for storing focus session metadata:
+  - session id
+  - start time
+  - end time
+  - elapsed seconds
+  - session state
+- telemetry table for storing time-based attention results:
+  - telemetry id
+  - related session id
+  - recorded time
+  - attention score
+  - attention state
+  - active application name
+  - application category
+  - whether a face was detected
+
+How it works:
+- A session is saved when it starts.
+- Session updates are saved when it is paused, resumed, or completed.
+- Every attention check during an active session creates one telemetry row.
+- Session updates use an upsert, so the same session row is updated instead of duplicated.
+- Session IDs continue from the highest ID already stored in the database.
+- SQLite foreign keys are enabled, so telemetry cannot reference a missing session.
+
+Privacy:
+- Raw webcam frames, images, and video data are never saved.
+- Only processed attention metadata is stored.
+
+Verification:
+- A temporary database was tested with a complete session lifecycle.
+- One session row and one linked telemetry row were saved correctly.
+- Completed sessions are available through the history endpoint.
+- Orphan telemetry records are rejected by the foreign-key constraint.
+
+Related files:
+- backend/main.py: connects session and attention API endpoints to the database.
+- backend/core/session.py: supports database-backed session IDs.
+- tests/test_database.py: verifies persistence, relationships, and no raw frame storage.
