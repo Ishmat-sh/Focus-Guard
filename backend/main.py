@@ -11,7 +11,6 @@ from backend.core.scoring import AttentionScorer, VisionSignals
 from backend.core.session import SessionManager
 from backend.storage.database import Database
 
-
 app = FastAPI(title="Focus Guard API")
 app.add_middleware(
     CORSMiddleware,
