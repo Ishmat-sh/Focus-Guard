@@ -1,8 +1,11 @@
 from dataclasses import asdict
+import os
 from time import time
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel
 
 from backend.context.active_app import get_active_application
 from backend.context.categories import categorize_application
@@ -10,6 +13,26 @@ from backend.core.alerts import AlertManager
 from backend.core.scoring import AttentionScorer, VisionSignals
 from backend.core.session import SessionManager
 from backend.storage.database import Database
+from backend.vision.analyzer import FaceAnalyzer
+
+
+class UserCreateRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
+class UserLoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+admin_security = HTTPBasic()
 
 app = FastAPI(title="Focus Guard API")
 app.add_middleware(
@@ -19,9 +42,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 database = Database()
+bootstrap_admin_username = os.getenv("FOCUS_GUARD_ADMIN_USERNAME")
+bootstrap_admin_password = os.getenv("FOCUS_GUARD_ADMIN_PASSWORD")
+if bootstrap_admin_username and bootstrap_admin_password:
+    database.create_admin(bootstrap_admin_username, bootstrap_admin_password)
 session_manager = SessionManager(next_id=database.next_session_id)
 scorer = AttentionScorer()
 alerts = AlertManager()
+face_analyzer = FaceAnalyzer()
 
 
 @app.get("/")
@@ -91,6 +119,57 @@ def attention() -> dict[str, object]:
     return asdict(result) | {"state": result.state.value, "alert": asdict(alert) if alert else None}
 
 
+@app.post("/attention/frame")
+def analyze_attention_frame(frame: bytes = Body(..., media_type="image/jpeg")) -> dict[str, object]:
+    if not frame:
+        raise HTTPException(400, "An image frame is required")
+    if len(frame) > 2_000_000:
+        raise HTTPException(413, "Image frame must be 2 MB or smaller")
+
+    import cv2
+    import numpy as np
+
+    image = cv2.imdecode(np.frombuffer(frame, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(400, "Could not decode image frame")
+
+    snapshot = face_analyzer.process(image)
+    app_name = get_active_application()
+    category = categorize_application(app_name)
+    signals = VisionSignals(
+        face_present=snapshot.face_present,
+        looking_at_screen=snapshot.gaze == "looking_at_screen",
+        upright=snapshot.posture == "upright",
+        blink_rate=snapshot.blink_rate,
+    )
+    result = scorer.score(signals, category.value, app_name)
+    session = session_manager.snapshot()
+    if session:
+        database.save_telemetry(session.id, time(), result, snapshot.face_present)
+    alert = alerts.update(
+        result.state.value == "distracted",
+        bool(session and session.state.value == "running"),
+    )
+    vision_score = max(
+        0,
+        100
+        - (0 if snapshot.face_present else 50)
+        - (0 if snapshot.gaze == "looking_at_screen" else 30)
+        - (0 if snapshot.posture == "upright" else 20),
+    )
+    return asdict(result) | {
+        "state": result.state.value,
+        "face_present": snapshot.face_present,
+        "blink_count": snapshot.blink_count,
+        "blink_frequency": snapshot.blink_rate,
+        "gaze": snapshot.gaze,
+        "head_pose": snapshot.head_pose,
+        "posture": snapshot.posture,
+        "vision_score": vision_score,
+        "alert": asdict(alert) if alert else None,
+    }
+
+
 @app.get("/metrics")
 def metrics() -> dict[str, object]:
     session = session_manager.snapshot()
@@ -102,6 +181,69 @@ def history() -> list[dict[str, object]]:
     return database.history()
 
 
+@app.post("/users", status_code=201)
+def create_user(payload: UserCreateRequest) -> dict[str, object]:
+    if len(payload.password) < 8:
+        raise HTTPException(422, "Password must be at least 8 characters")
+    try:
+        return database.create_user(payload.name, payload.email, payload.password)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.post("/auth/login")
+def user_login(payload: UserLoginRequest) -> dict[str, object]:
+    user = database.verify_user(payload.email, payload.password)
+    if user is None:
+        raise HTTPException(401, "Invalid email or password")
+    return {"ok": True, "user": user}
+
+
+@app.post("/admin/login")
+def admin_login(payload: AdminLoginRequest) -> dict[str, object]:
+    if not database.verify_admin(payload.username, payload.password):
+        raise HTTPException(401, "Invalid admin credentials")
+    return {"ok": True, "username": payload.username}
+
+
+@app.get("/users")
+def list_users(
+    credentials: HTTPBasicCredentials = Depends(admin_security),
+) -> list[dict[str, object]]:
+    _require_admin(credentials)
+    return database.list_users()
+
+
+@app.get("/admins")
+def list_admins(
+    credentials: HTTPBasicCredentials = Depends(admin_security),
+) -> list[dict[str, object]]:
+    _require_admin(credentials)
+    return database.list_admins()
+
+
+@app.get("/admin/database/tables")
+def database_tables(
+    credentials: HTTPBasicCredentials = Depends(admin_security),
+) -> list[dict[str, object]]:
+    _require_admin(credentials)
+    return database.list_tables()
+
+
+@app.get("/admin/database/tables/{table_name}")
+def database_table(
+    table_name: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    credentials: HTTPBasicCredentials = Depends(admin_security),
+) -> dict[str, object]:
+    _require_admin(credentials)
+    try:
+        return database.inspect_table(table_name, limit=limit, offset=offset)
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+
+
 def _session_action(action, persist: bool = False) -> dict[str, object]:
     try:
         session = action()
@@ -110,3 +252,12 @@ def _session_action(action, persist: bool = False) -> dict[str, object]:
     if persist:
         database.save_session(session)
     return asdict(session) | {"state": session.state.value}
+
+
+def _require_admin(credentials: HTTPBasicCredentials) -> None:
+    if not database.verify_admin(credentials.username, credentials.password):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid admin credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import secrets
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 
 class Database:
+    _PASSWORD_ITERATIONS = 310_000
+
     def __init__(self, path: str | Path = "focus_guard.db") -> None:
         self.path = str(path)
         self.connection = sqlite3.connect(self.path, check_same_thread=False)
@@ -64,21 +70,58 @@ class Database:
         self.connection.commit()
 
     def create_user(self, name: str, email: str, password: str) -> dict[str, Any]:
-        existing = self.connection.execute(
-            "SELECT * FROM users WHERE email = ? LIMIT 1",
-            (email,),
-        ).fetchone()
-        if existing is not None:
-            return self._redact_sensitive_values(dict(existing))
-
-        cursor = self.connection.execute(
-            "INSERT INTO users (name, email, password) VALUES (?, ?, ?)",
-            (name, email, password),
-        )
+        normalized_email = email.strip().lower()
+        try:
+            cursor = self.connection.execute(
+                "INSERT INTO users (name, email, password) VALUES (?, ?, ?)",
+                (name.strip(), normalized_email, self._hash_password(password)),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ValueError("An account with this email already exists") from error
         self.connection.commit()
-        return self._redact_sensitive_values(
-            {"id": cursor.lastrowid, "name": name, "email": email, "password": password}
+        return {"id": cursor.lastrowid, "name": name.strip(), "email": normalized_email}
+
+    def verify_user(self, email: str, password: str) -> dict[str, Any] | None:
+        normalized_email = email.strip().lower()
+        row = self.connection.execute(
+            "SELECT id, name, email, password FROM users WHERE email = ? LIMIT 1",
+            (normalized_email,),
+        ).fetchone()
+        if row is None or not self._verify_password(password, row["password"]):
+            return None
+
+        if not row["password"].startswith("pbkdf2_sha256$"):
+            self.connection.execute(
+                "UPDATE users SET password = ? WHERE id = ?",
+                (self._hash_password(password), row["id"]),
+            )
+            self.connection.commit()
+        return {"id": row["id"], "name": row["name"], "email": row["email"]}
+
+    @classmethod
+    def _hash_password(cls, password: str) -> str:
+        salt = secrets.token_bytes(16)
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, cls._PASSWORD_ITERATIONS)
+        return "pbkdf2_sha256${}${}${}".format(
+            cls._PASSWORD_ITERATIONS,
+            base64.b64encode(salt).decode(),
+            base64.b64encode(digest).decode(),
         )
+
+    @staticmethod
+    def _verify_password(password: str, encoded: str) -> bool:
+        if not encoded.startswith("pbkdf2_sha256$"):
+            return hmac.compare_digest(password, encoded)
+        try:
+            algorithm, iterations, salt_text, digest_text = encoded.split("$", 3)
+            if algorithm != "pbkdf2_sha256":
+                return False
+            salt = base64.b64decode(salt_text, validate=True)
+            expected = base64.b64decode(digest_text, validate=True)
+            actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, int(iterations))
+            return hmac.compare_digest(actual, expected)
+        except (ValueError, TypeError):
+            return False
 
     def list_users(self) -> list[dict[str, Any]]:
         rows = self.connection.execute("SELECT * FROM users ORDER BY id ASC").fetchall()
@@ -157,11 +200,11 @@ class Database:
 
         cursor = self.connection.execute(
             "INSERT INTO admins (username, password, email) VALUES (?, ?, ?)",
-            (username, password, email),
+            (username, self._hash_password(password), email),
         )
         self.connection.commit()
         return self._redact_sensitive_values(
-            {"id": cursor.lastrowid, "username": username, "password": password, "email": email}
+            {"id": cursor.lastrowid, "username": username, "email": email}
         )
 
     def list_admins(self) -> list[dict[str, Any]]:
@@ -170,15 +213,24 @@ class Database:
 
     def verify_admin(self, username: str, password: str) -> bool:
         row = self.connection.execute(
-            "SELECT 1 FROM admins WHERE username = ? AND password = ? LIMIT 1",
-            (username, password),
+            "SELECT id, password FROM admins WHERE username = ? LIMIT 1",
+            (username,),
         ).fetchone()
-        return row is not None
+        if row is None or not self._verify_password(password, row["password"]):
+            return False
+        if not row["password"].startswith("pbkdf2_sha256$"):
+            self.connection.execute(
+                "UPDATE admins SET password = ? WHERE id = ?",
+                (self._hash_password(password), row["id"]),
+            )
+            self.connection.commit()
+        return True
 
     def validate_admin(self, username: str, password: str) -> dict[str, Any] | None:
+        if not self.verify_admin(username, password):
+            return None
         row = self.connection.execute(
-            "SELECT * FROM admins WHERE username = ? AND password = ? LIMIT 1",
-            (username, password),
+            "SELECT * FROM admins WHERE username = ? LIMIT 1", (username,)
         ).fetchone()
         return self._redact_sensitive_values(dict(row)) if row else None
 

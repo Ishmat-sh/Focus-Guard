@@ -4,6 +4,7 @@ const API = "http://localhost:8000";
 
 function App() {
   const [page, setPage] = useState("home");
+  const [adminCredentials, setAdminCredentials] = useState(null);
 
   // =====================================================
   // HOME PAGE
@@ -47,16 +48,20 @@ function App() {
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
 
-    function signup(e) {
+    async function signup(e) {
       e.preventDefault();
-
-      console.log("Name:", name);
-      console.log("Email:", email);
-      console.log("Password:", password);
-
-      alert("Account created!");
-
-      setPage("camera");
+      try {
+        const response = await fetch(`${API}/users`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, email, password }),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Could not create account");
+        setPage("camera");
+      } catch (error) {
+        alert(error.message || "Could not connect to the server");
+      }
     }
 
     return (
@@ -118,15 +123,20 @@ function App() {
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
 
-    function login(e) {
+    async function login(e) {
       e.preventDefault();
-
-      console.log("Email:", email);
-      console.log("Password:", password);
-
-      alert("Login successful!");
-
-      setPage("camera");
+      try {
+        const response = await fetch(`${API}/auth/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, password }),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Could not sign in");
+        setPage("camera");
+      } catch (error) {
+        alert(error.message || "Could not connect to the server");
+      }
     }
 
     return (
@@ -180,17 +190,20 @@ function App() {
     const [username, setUsername] = useState("");
     const [password, setPassword] = useState("");
 
-    function adminLogin(e) {
+    async function adminLogin(e) {
       e.preventDefault();
-
-      if (
-        username === "admin" &&
-        password === "admin123"
-      ) {
-        alert("Admin login successful!");
+      try {
+        const response = await fetch(`${API}/admin/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password }),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Invalid admin credentials");
+        setAdminCredentials({ username, password });
         setPage("adminDashboard");
-      } else {
-        alert("Wrong username or password");
+      } catch (error) {
+        alert(error.message || "Could not connect to the server");
       }
     }
 
@@ -368,6 +381,27 @@ function App() {
       return response.json();
     }
 
+    async function requestAttention() {
+      const video = document.getElementById("camera");
+      if (!video || video.readyState < 2 || !video.videoWidth) {
+        return request("/attention");
+      }
+
+      const canvas = document.createElement("canvas");
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      canvas.getContext("2d").drawImage(video, 0, 0);
+      const frame = await new Promise((resolve) =>
+        canvas.toBlob(resolve, "image/jpeg", 0.7)
+      );
+      if (!frame) return request("/attention");
+      return request("/attention/frame", {
+        method: "POST",
+        headers: { "Content-Type": "image/jpeg" },
+        body: frame,
+      });
+    }
+
     // -------------------------------------------------
     // REFRESH DATA
     // -------------------------------------------------
@@ -380,7 +414,7 @@ function App() {
           past,
         ] = await Promise.all([
           request("/sessions/current"),
-          request("/attention"),
+          requestAttention(),
           request("/history"),
         ]);
 
@@ -756,9 +790,7 @@ function App() {
             data &&
             data.length > 0
           ) {
-            setSummary(
-              data[data.length - 1]
-            );
+            setSummary(data[0]);
           }
         } catch (error) {
           console.log(error);
@@ -845,6 +877,28 @@ function App() {
   }
   // ADMIN DASHBOARD
   function AdminDashboard() {
+    const [users, setUsers] = useState([]);
+    const [admins, setAdmins] = useState([]);
+    const [error, setError] = useState("");
+
+    useEffect(() => {
+      if (!adminCredentials) {
+        setPage("admin");
+        return;
+      }
+      const authorization = `Basic ${btoa(`${adminCredentials.username}:${adminCredentials.password}`)}`;
+      Promise.all([
+        fetch(`${API}/users`, { headers: { Authorization: authorization } }),
+        fetch(`${API}/admins`, { headers: { Authorization: authorization } }),
+      ])
+        .then(async ([userResponse, adminResponse]) => {
+          if (!userResponse.ok || !adminResponse.ok) throw new Error("Could not load admin records");
+          setUsers(await userResponse.json());
+          setAdmins(await adminResponse.json());
+        })
+        .catch((loadError) => setError(loadError.message));
+    }, []);
+
     return (
       <div>
         <div className="navbar">
@@ -852,59 +906,52 @@ function App() {
             Admin Dashboard
           </h2>
           <button
-            onClick={() =>
-              setPage("home")
-            }
+            onClick={() => {
+              setAdminCredentials(null);
+              setPage("home");
+            }}
           >
             Logout
           </button>
         </div>
         <div className="dashboard">
           <h1>
-            Users
+            Users ({users.length})
           </h1>
           <p>
-            Registered users and
-            performance information.
+            Registered account details.
           </p>
+          {error && <p className="error-banner">{error}</p>}
           <table>
             <thead>
               <tr>
+                <th>ID</th>
                 <th>
                   Name
                 </th>
                 <th>
                   Email
                 </th>
-                <th>
-                  Score
-                </th>
+                <th>Registered</th>
               </tr>
             </thead>
             <tbody>
-              <tr>
-                <td>
-                  User 1
-                </td>
-                <td>
-                  user1@gmail.com
-                </td>
-                <td>
-                  85
-                </td>
-              </tr>
-              <tr>
-                <td>
-                  User 2
-                </td>
-                <td>
-                  user2@gmail.com
-                </td>
-                <td>
-                  78
-                </td>
-              </tr>
+              {users.length === 0 ? <tr><td colSpan="4">No registered users</td></tr> : users.map((user) => (
+                <tr key={user.id}>
+                  <td>{user.id}</td>
+                  <td>{user.name}</td>
+                  <td>{user.email}</td>
+                  <td>{user.created_at ? new Date(user.created_at * 1000).toLocaleString() : "—"}</td>
+                </tr>
+              ))}
             </tbody>
+          </table>
+          <h2>Admin Accounts</h2>
+          <table>
+            <thead><tr><th>Username</th><th>Email</th></tr></thead>
+            <tbody>{admins.length === 0 ? <tr><td colSpan="2">No admin accounts</td></tr> : admins.map((admin) => (
+              <tr key={admin.id}><td>{admin.username}</td><td>{admin.email || "—"}</td></tr>
+            ))}</tbody>
           </table>
         </div>
       </div>

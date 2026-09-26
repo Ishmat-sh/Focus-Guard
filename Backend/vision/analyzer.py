@@ -50,14 +50,21 @@ class FaceAnalyzer:
     def __init__(self, ear_threshold: float = 0.21) -> None:
         self.ear_threshold = ear_threshold
         self.snapshot = VisionSnapshot()
+        self._mesh = None
+
+    def close(self) -> None:
+        if self._mesh is not None:
+            self._mesh.close()
+            self._mesh = None
 
     def process(self, frame) -> VisionSnapshot:
         self.snapshot = VisionSnapshot()
         try:
             import mediapipe as mp
             rgb = frame[:, :, ::-1]
-            with mp.solutions.face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True) as mesh:
-                result = mesh.process(rgb)
+            if self._mesh is None:
+                self._mesh = mp.solutions.face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
+            result = self._mesh.process(rgb)
             if not result or not getattr(result, "multi_face_landmarks", None):
                 self.snapshot.face_present = False
                 self.snapshot.gaze = "looking_away"
