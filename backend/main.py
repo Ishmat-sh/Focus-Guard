@@ -7,13 +7,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
-from backend.context.active_app import get_active_application
-from backend.context.categories import categorize_application
-from backend.core.alerts import AlertManager
-from backend.core.scoring import AttentionScorer, VisionSignals
-from backend.core.session import SessionManager
-from backend.storage.database import Database
-from backend.vision.analyzer import FaceAnalyzer
+from Backend.context.active_app import get_active_application
+from Backend.context.categories import categorize_application
+from Backend.core.alerts import AlertManager
+from Backend.core.scoring import AttentionScorer, VisionSignals
+from Backend.core.session import SessionManager
+from Backend.storage.database import Database
+from Backend.vision.analyzer import FaceAnalyzer
 
 
 class UserCreateRequest(BaseModel):
