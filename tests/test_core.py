@@ -1,8 +1,13 @@
+import sys
+import types
+
+import numpy as np
+
 from backend.context.categories import AppCategory, categorize_application
 from backend.core.alerts import AlertManager
 from backend.core.scoring import AttentionScorer, AttentionState, VisionSignals
 from backend.core.session import SessionManager, SessionState
-from backend.vision.analyzer import detect_blink, eye_aspect_ratio, gaze_state, head_pose, posture_state
+from backend.vision.analyzer import FaceAnalyzer, detect_blink, eye_aspect_ratio, gaze_state, head_pose, posture_state
 
 
 def test_session_manager_tracks_pause_and_resume() -> None:
@@ -44,3 +49,58 @@ def test_vision_helpers() -> None:
     assert head_pose(-20, 0) == "left"
     assert gaze_state(0.5, 0.5) == "looking_at_screen"
     assert posture_state(1.0, 1.0) == "upright"
+
+
+def test_face_analyzer_uses_landmarks_for_face_detection_and_gaze(monkeypatch) -> None:
+    class FakeLandmark:
+        def __init__(self, x: float, y: float) -> None:
+            self.x = x
+            self.y = y
+            self.z = 0.0
+
+    class FakeFace:
+        def __init__(self, landmarks):
+            self.landmark = landmarks
+
+    class FakeResult:
+        def __init__(self, landmarks):
+            self.multi_face_landmarks = [FakeFace(landmarks)]
+
+    class FakeFaceMesh:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def process(self, rgb):
+            return FakeResult(landmarks)
+
+    landmarks = [FakeLandmark(0.5, 0.5) for _ in range(468)]
+    landmarks[33] = FakeLandmark(0.46, 0.48)
+    landmarks[133] = FakeLandmark(0.5, 0.48)
+    landmarks[159] = FakeLandmark(0.47, 0.52)
+    landmarks[145] = FakeLandmark(0.43, 0.52)
+    landmarks[153] = FakeLandmark(0.53, 0.52)
+    landmarks[155] = FakeLandmark(0.5, 0.52)
+    landmarks[263] = FakeLandmark(0.54, 0.48)
+    landmarks[362] = FakeLandmark(0.46, 0.48)
+    landmarks[10] = FakeLandmark(0.5, 0.35)
+    landmarks[152] = FakeLandmark(0.5, 0.18)
+    landmarks[168] = FakeLandmark(0.5, 0.7)
+    landmarks[9] = FakeLandmark(0.5, 0.5)
+
+    fake_mp = types.SimpleNamespace(
+        solutions=types.SimpleNamespace(face_mesh=types.SimpleNamespace(FaceMesh=FakeFaceMesh))
+    )
+    monkeypatch.setitem(sys.modules, "mediapipe", fake_mp)
+
+    snapshot = FaceAnalyzer().process(np.zeros((120, 160, 3), dtype=np.uint8))
+
+    assert snapshot.face_present is True
+    assert snapshot.head_pose in {"forward", "left", "right", "up", "down"}
+    assert snapshot.gaze == "looking_at_screen"
+    assert snapshot.posture in {"upright", "slouched", "unknown"}

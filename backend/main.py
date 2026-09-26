@@ -1,8 +1,10 @@
 from dataclasses import asdict
 from time import time
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel
 
 from backend.context.active_app import get_active_application
 from backend.context.categories import categorize_application
@@ -10,6 +12,20 @@ from backend.core.alerts import AlertManager
 from backend.core.scoring import AttentionScorer, VisionSignals
 from backend.core.session import SessionManager
 from backend.storage.database import Database
+
+
+class UserCreateRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+admin_security = HTTPBasic()
 
 
 app = FastAPI(title="Focus Guard API")
@@ -20,6 +36,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 database = Database()
+database.create_admin("admin", "admin123", "admin@focusguard.local")
 session_manager = SessionManager(next_id=database.next_session_id)
 scorer = AttentionScorer()
 alerts = AlertManager()
@@ -103,6 +120,53 @@ def history() -> list[dict[str, object]]:
     return database.history()
 
 
+@app.get("/users")
+def get_users() -> list[dict[str, object]]:
+    return database.list_users()
+
+
+@app.post("/users")
+def create_user(payload: UserCreateRequest) -> dict[str, object]:
+    try:
+        return database.create_user(payload.name, payload.email, payload.password)
+    except Exception as error:  # pragma: no cover - defensive API guard
+        raise HTTPException(400, str(error)) from error
+
+
+@app.get("/admins")
+def get_admins() -> list[dict[str, object]]:
+    return database.list_admins()
+
+
+@app.get("/admin/database/tables")
+def database_tables(
+    credentials: HTTPBasicCredentials = Depends(admin_security),
+) -> list[dict[str, object]]:
+    _require_admin(credentials)
+    return database.list_tables()
+
+
+@app.get("/admin/database/tables/{table_name}")
+def database_table(
+    table_name: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    credentials: HTTPBasicCredentials = Depends(admin_security),
+) -> dict[str, object]:
+    _require_admin(credentials)
+    try:
+        return database.inspect_table(table_name, limit=limit, offset=offset)
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+
+
+@app.post("/admin/login")
+def admin_login(payload: AdminLoginRequest) -> dict[str, object]:
+    if database.verify_admin(payload.username, payload.password):
+        return {"ok": True, "username": payload.username}
+    raise HTTPException(401, "Invalid admin credentials")
+
+
 def _session_action(action, persist: bool = False) -> dict[str, object]:
     try:
         session = action()
@@ -111,3 +175,12 @@ def _session_action(action, persist: bool = False) -> dict[str, object]:
     if persist:
         database.save_session(session)
     return asdict(session) | {"state": session.state.value}
+
+
+def _require_admin(credentials: HTTPBasicCredentials) -> None:
+    if not database.verify_admin(credentials.username, credentials.password):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid admin credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )

@@ -3,13 +3,14 @@ import { useState, useEffect } from "react";
 function App() {
   // This controls which page is displayed
   const [page, setPage] = useState("home");
+  const [adminCredentials, setAdminCredentials] = useState(null);
   // =====================================================
   // HOME PAGE
   // =====================================================
   function Home() {
     return (
       <div className="page">
-        <h1>Focus Tracker</h1>
+        <h1>Focus Guard</h1>
         <p>
           Track your focus and performance.
         </p>
@@ -41,14 +42,28 @@ function App() {
     const [name, setName] = useState("");
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
-    function signup(e) {
+    async function signup(e) {
       e.preventDefault();
-      console.log("Name:", name);
-      console.log("Email:", email);
-      console.log("Password:", password);
-      alert("Account created!");
-      // Go to camera page
-      setPage("camera");
+
+      try {
+        const response = await fetch("http://localhost:8000/users", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ name, email, password })
+        });
+
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({}));
+          throw new Error(err.detail || "Could not create account");
+        }
+
+        alert("Account created!");
+        setPage("camera");
+      } catch (error) {
+        alert(error.message || "Failed to create account");
+      }
     }
     return (
       <div className="page">
@@ -167,18 +182,24 @@ function App() {
   function AdminLogin() {
     const [username, setUsername] = useState("");
     const [password, setPassword] = useState("");
-    function adminLogin(e) {
+    async function adminLogin(e) {
       e.preventDefault();
-      // Temporary admin login
-      // We will connect this to the backend later
-      if (
-        username === "admin" &&
-        password === "admin123"
-      ) {
+      try {
+        const response = await fetch("http://localhost:8000/admin/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password })
+        });
+
+        if (!response.ok) {
+          throw new Error("Invalid admin credentials");
+        }
+
+        setAdminCredentials({ username, password });
         alert("Admin login successful!");
         setPage("adminDashboard");
-      } else {
-        alert("Wrong username or password");
+      } catch (error) {
+        alert(error.message || "Wrong username or password");
       }
     }
     return (
@@ -474,66 +495,161 @@ function App() {
   // ADMIN DASHBOARD
   // =====================================================
   function AdminDashboard() {
+    const [tables, setTables] = useState([]);
+    const [activeTable, setActiveTable] = useState("");
+    const [tableData, setTableData] = useState(null);
+    const [tableSearch, setTableSearch] = useState("");
+    const [offset, setOffset] = useState(0);
+    const [activeView, setActiveView] = useState("documents");
+    const [refreshKey, setRefreshKey] = useState(0);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState("");
+    const pageSize = 100;
+
+    useEffect(() => {
+      async function loadTables() {
+        try {
+          const authorization = `Basic ${btoa(`${adminCredentials.username}:${adminCredentials.password}`)}`;
+          const response = await fetch("http://localhost:8000/admin/database/tables", {
+            headers: { Authorization: authorization }
+          });
+          if (!response.ok) throw new Error("Could not load database tables");
+          const data = await response.json();
+          setTables(data);
+          setActiveTable((current) => current || data[0]?.name || "");
+          setError("");
+        } catch (loadError) {
+          setError(loadError.message || "Could not connect to the database");
+        }
+      }
+
+      loadTables();
+    }, [refreshKey, adminCredentials]);
+
+    useEffect(() => {
+      if (!activeTable) {
+        setLoading(false);
+        return;
+      }
+
+      let cancelled = false;
+      async function loadTable() {
+        setLoading(true);
+        try {
+          const response = await fetch(
+            `http://localhost:8000/admin/database/tables/${encodeURIComponent(activeTable)}?limit=${pageSize}&offset=${offset}`,
+            { headers: { Authorization: `Basic ${btoa(`${adminCredentials.username}:${adminCredentials.password}`)}` } }
+          );
+          if (!response.ok) throw new Error("Could not load this table");
+          const data = await response.json();
+          if (!cancelled) {
+            setTableData(data);
+            setError("");
+          }
+        } catch (loadError) {
+          if (!cancelled) setError(loadError.message || "Could not load this table");
+        } finally {
+          if (!cancelled) setLoading(false);
+        }
+      }
+
+      loadTable();
+      return () => { cancelled = true; };
+    }, [activeTable, offset, refreshKey]);
+
+    const visibleTables = tables.filter((table) =>
+      table.name.toLowerCase().includes(tableSearch.toLowerCase())
+    );
+
+    function selectTable(name) {
+      setActiveTable(name);
+      setOffset(0);
+    }
+
     return (
-      <div>
-        {/* NAVBAR */}
-        <div className="navbar">
-          <h2>
-            Admin Dashboard
-          </h2>
-          <button
-            onClick={() =>
-              setPage("home")
-            }
-          >
-            Logout
-          </button>
-        </div>
-        {/* ADMIN CONTENT */}
-        <div className="dashboard">
-          <h1>
-            Users
-          </h1>
-          <table>
-            <thead>
-              <tr>
-                <th>
-                  Name
-                </th>
-                <th>
-                  Email
-                </th>
-                <th>
-                  Score
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td>
-                  User 1
-                </td>
-                <td>
-                  user1@gmail.com
-                </td>
-                <td>
-                  85
-                </td>
-              </tr>
-              <tr>
-                <td>
-                  User 2
-                </td>
-                <td>
-                  user2@gmail.com
-                </td>
-                <td>
-                  78
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
+      <div className="database-page">
+        <header className="database-navbar">
+          <div className="database-brand"><span className="database-brand-mark">FG</span><strong>Focus Guard</strong><span className="database-divider" /> <span>Database</span></div>
+          <div className="database-navbar-actions">
+            <span className="database-engine">SQLite</span>
+             <button className="database-logout" onClick={() => { setAdminCredentials(null); setPage("home"); }}>Log out</button>
+          </div>
+        </header>
+        <div className="database-crumb"><span>Connections</span><span>/</span><strong>focus_guard.db</strong></div>
+        <main className="database-workspace">
+          <aside className="database-sidebar">
+            <div className="database-sidebar-title"><span>COLLECTIONS</span><span>{tables.length}</span></div>
+            <label className="database-search">
+              <span aria-hidden="true">⌕</span>
+              <input value={tableSearch} onChange={(event) => setTableSearch(event.target.value)} placeholder="Filter tables" aria-label="Filter tables" />
+            </label>
+            <div className="database-table-list">
+              {visibleTables.map((table) => (
+                <button
+                  className={`database-table-item ${activeTable === table.name ? "active" : ""}`}
+                  key={table.name}
+                  onClick={() => selectTable(table.name)}
+                >
+                  <span className="database-table-icon" aria-hidden="true">▤</span>
+                  <span className="database-table-name">{table.name}</span>
+                  <span className="database-table-count">{table.row_count}</span>
+                </button>
+              ))}
+              {visibleTables.length === 0 && <div className="database-sidebar-empty">No matching tables</div>}
+            </div>
+            <div className="database-sidebar-footer"><span className="database-status-dot" /> Connected to local database</div>
+          </aside>
+          <section className="database-main">
+            <div className="database-toolbar">
+              <div>
+                <div className="database-eyebrow">TABLE</div>
+                <h1>{activeTable || "Database tables"}</h1>
+              </div>
+              <button className="database-refresh" title="Refresh database" aria-label="Refresh database" onClick={() => setRefreshKey((key) => key + 1)}>↻</button>
+            </div>
+            {error && <div className="database-error">{error}</div>}
+            <div className="database-tabs">
+              <button className={activeView === "documents" ? "selected" : ""} onClick={() => setActiveView("documents")}>Documents <b>{tableData?.total ?? 0}</b></button>
+              <button className={activeView === "schema" ? "selected" : ""} onClick={() => setActiveView("schema")}>Schema <b>{tableData?.columns?.length ?? 0}</b></button>
+            </div>
+            {activeView === "documents" ? <>
+              <div className="database-grid-wrap">
+                {loading ? <div className="database-empty">Loading table data…</div> : tableData?.rows?.length ? (
+                  <table className="database-grid">
+                    <thead><tr>{tableData.columns.map((column) => <th key={column.name}><span>{column.name}</span><small>{column.type || "ANY"}{column.primary_key ? " · PK" : ""}</small></th>)}</tr></thead>
+                    <tbody>{tableData.rows.map((row, rowIndex) => (
+                      <tr key={`${activeTable}-${offset}-${rowIndex}`}>
+                        {tableData.columns.map((column) => {
+                          const value = row[column.name];
+                          const display = value === null || value === undefined ? "NULL" : typeof value === "object" ? JSON.stringify(value) : String(value);
+                          return <td key={column.name} title={display} className={value == null ? "is-null" : ""}>{display}</td>;
+                        })}
+                      </tr>
+                    ))}</tbody>
+                  </table>
+                ) : <div className="database-empty">{activeTable ? "This table is empty" : "No tables found"}</div>}
+              </div>
+              <footer className="database-grid-footer">
+                <span>{tableData ? `${tableData.total === 0 ? 0 : offset + 1}–${Math.min(offset + pageSize, tableData.total)} of ${tableData.total} rows` : "Select a table to browse its rows"}</span>
+                <div className="database-pagination">
+                  <button disabled={offset === 0 || loading} onClick={() => setOffset(Math.max(0, offset - pageSize))} aria-label="Previous page">‹</button>
+                  <span>{tableData?.total ? Math.floor(offset / pageSize) + 1 : 0}</span>
+                  <button disabled={!tableData || offset + pageSize >= tableData.total || loading} onClick={() => setOffset(offset + pageSize)} aria-label="Next page">›</button>
+                </div>
+              </footer>
+            </> : <section className="database-schema">
+              <div className="database-schema-heading"><h2>{activeTable} fields</h2><span>{tableData?.columns?.length ?? 0} fields</span></div>
+              <div className="database-schema-list">
+                {tableData?.columns?.map((column) => (
+                  <div className="database-schema-row" key={column.name}>
+                    <code>{column.name}</code><span>{column.type || "ANY"}</span>
+                    <small>{column.primary_key ? "PRIMARY KEY" : column.not_null ? "REQUIRED" : "NULLABLE"}</small>
+                  </div>
+                ))}
+              </div>
+            </section>}
+          </section>
+        </main>
       </div>
     );
   }

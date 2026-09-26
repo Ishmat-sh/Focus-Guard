@@ -23,6 +23,20 @@ class Database:
                 app_name TEXT, app_category TEXT, face_present INTEGER NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES sessions(id)
             );
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                created_at REAL NOT NULL DEFAULT (strftime('%s', 'now'))
+            );
+            CREATE TABLE IF NOT EXISTS admins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                email TEXT,
+                created_at REAL NOT NULL DEFAULT (strftime('%s', 'now'))
+            );
             """
         )
         self.connection.commit()
@@ -48,6 +62,125 @@ class Database:
             (session_id, recorded_at, result.score, result.state.value, result.app_name, result.app_category, int(face_present)),
         )
         self.connection.commit()
+
+    def create_user(self, name: str, email: str, password: str) -> dict[str, Any]:
+        existing = self.connection.execute(
+            "SELECT * FROM users WHERE email = ? LIMIT 1",
+            (email,),
+        ).fetchone()
+        if existing is not None:
+            return self._redact_sensitive_values(dict(existing))
+
+        cursor = self.connection.execute(
+            "INSERT INTO users (name, email, password) VALUES (?, ?, ?)",
+            (name, email, password),
+        )
+        self.connection.commit()
+        return self._redact_sensitive_values(
+            {"id": cursor.lastrowid, "name": name, "email": email, "password": password}
+        )
+
+    def list_users(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute("SELECT * FROM users ORDER BY id ASC").fetchall()
+        return [self._redact_sensitive_values(dict(row)) for row in rows]
+
+    def get_users(self) -> list[dict[str, Any]]:
+        return self.list_users()
+
+    def list_tables(self) -> list[dict[str, Any]]:
+        tables = self.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+        return [
+            {
+                "name": row["name"],
+                "row_count": self.connection.execute(
+                    f"SELECT COUNT(*) FROM {self._quote_identifier(row['name'])}"
+                ).fetchone()[0],
+            }
+            for row in tables
+        ]
+
+    def inspect_table(self, table_name: str, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+        table_names = {table["name"] for table in self.list_tables()}
+        if table_name not in table_names:
+            raise ValueError(f"Unknown table: {table_name}")
+
+        quoted_name = self._quote_identifier(table_name)
+        schema = self.connection.execute(f"PRAGMA table_info({quoted_name})").fetchall()
+        columns = [
+            {
+                "name": column["name"],
+                "type": column["type"],
+                "not_null": bool(column["notnull"]),
+                "primary_key": bool(column["pk"]),
+            }
+            for column in schema
+        ]
+        rows = self.connection.execute(
+            f"SELECT * FROM {quoted_name} LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        safe_rows = [
+            {
+                key: "[redacted]" if self._is_sensitive_column(key) else value
+                for key, value in dict(row).items()
+            }
+            for row in rows
+        ]
+        total = self.connection.execute(f"SELECT COUNT(*) FROM {quoted_name}").fetchone()[0]
+        return {"name": table_name, "columns": columns, "rows": safe_rows, "total": total}
+
+    @staticmethod
+    def _quote_identifier(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
+
+    @staticmethod
+    def _is_sensitive_column(column_name: str) -> bool:
+        lowered = column_name.lower()
+        return any(marker in lowered for marker in ("password", "secret", "token"))
+
+    @classmethod
+    def _redact_sensitive_values(cls, values: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: "[redacted]" if cls._is_sensitive_column(key) else value
+            for key, value in values.items()
+        }
+
+    def create_admin(self, username: str, password: str, email: str | None = None) -> dict[str, Any]:
+        existing = self.connection.execute(
+            "SELECT * FROM admins WHERE username = ? LIMIT 1",
+            (username,),
+        ).fetchone()
+        if existing is not None:
+            return self._redact_sensitive_values(dict(existing))
+
+        cursor = self.connection.execute(
+            "INSERT INTO admins (username, password, email) VALUES (?, ?, ?)",
+            (username, password, email),
+        )
+        self.connection.commit()
+        return self._redact_sensitive_values(
+            {"id": cursor.lastrowid, "username": username, "password": password, "email": email}
+        )
+
+    def list_admins(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute("SELECT * FROM admins ORDER BY id ASC").fetchall()
+        return [self._redact_sensitive_values(dict(row)) for row in rows]
+
+    def verify_admin(self, username: str, password: str) -> bool:
+        row = self.connection.execute(
+            "SELECT 1 FROM admins WHERE username = ? AND password = ? LIMIT 1",
+            (username, password),
+        ).fetchone()
+        return row is not None
+
+    def validate_admin(self, username: str, password: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM admins WHERE username = ? AND password = ? LIMIT 1",
+            (username, password),
+        ).fetchone()
+        return self._redact_sensitive_values(dict(row)) if row else None
 
     def history(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.connection.execute("SELECT * FROM sessions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
