@@ -283,6 +283,43 @@ td {
 th {
   background-color: #ddd;
 }
+.reset-password-result {
+  margin: 16px 0;
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border: 1px solid #b6cfbd;
+  border-left: 4px solid #3a8052;
+  background: #f2f8f3;
+  color: #294b34;
+  text-align: left;
+}
+.reset-password-result code {
+  display: block;
+  width: fit-content;
+  margin: 8px 0;
+  padding: 7px 10px;
+  background: #fff;
+  border: 1px solid #dce7de;
+  color: #26352a;
+  font-size: 14px;
+  user-select: all;
+}
+.reset-password-result small {
+  display: block;
+  color: #617467;
+}
+.reset-password-result button {
+  flex: 0 0 auto;
+}
+.delete-user-button {
+  background: #9c3935;
+}
+.delete-user-button:hover {
+  background: #7d2b28;
+}
 /* =====================================================
    RESPONSIVE
    ===================================================== */

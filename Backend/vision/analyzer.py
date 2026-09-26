@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from math import dist
+from time import monotonic
 
 
 @dataclass
@@ -51,11 +53,22 @@ class FaceAnalyzer:
         self.ear_threshold = ear_threshold
         self.snapshot = VisionSnapshot()
         self._mesh = None
+        self._eyes_were_closed = False
+        self._blink_times: deque[float] = deque()
 
     def close(self) -> None:
         if self._mesh is not None:
             self._mesh.close()
             self._mesh = None
+
+    def _record_blink_state(self, eyes_closed: bool, now: float | None = None) -> int:
+        timestamp = monotonic() if now is None else now
+        if self._eyes_were_closed and not eyes_closed:
+            self._blink_times.append(timestamp)
+        self._eyes_were_closed = eyes_closed
+        while self._blink_times and timestamp - self._blink_times[0] > 60:
+            self._blink_times.popleft()
+        return len(self._blink_times)
 
     def process(self, frame) -> VisionSnapshot:
         self.snapshot = VisionSnapshot()
@@ -70,6 +83,7 @@ class FaceAnalyzer:
                 self.snapshot.gaze = "looking_away"
                 self.snapshot.head_pose = "unknown"
                 self.snapshot.posture = "unknown"
+                self._eyes_were_closed = False
                 return self.snapshot
 
             landmarks = result.multi_face_landmarks[0].landmark
@@ -78,9 +92,9 @@ class FaceAnalyzer:
             right_eye = [landmarks[i] for i in (362, 263, 386, 374, 381, 380)]
             left_ear = eye_aspect_ratio([(lm.x, lm.y) for lm in left_eye])
             right_ear = eye_aspect_ratio([(lm.x, lm.y) for lm in right_eye])
-            blink_detected = detect_blink((left_ear + right_ear) / 2.0, threshold=self.ear_threshold)
-            self.snapshot.blink_count = 1 if blink_detected else 0
-            self.snapshot.blink_rate = 1.0 if blink_detected else 0.0
+            eyes_closed = detect_blink((left_ear + right_ear) / 2.0, threshold=self.ear_threshold)
+            self.snapshot.blink_count = self._record_blink_state(eyes_closed)
+            self.snapshot.blink_rate = float(self.snapshot.blink_count)
 
             nose = landmarks[1]
             forehead = landmarks[10]
@@ -99,14 +113,11 @@ class FaceAnalyzer:
             vertical_ratio = 1.0 - min(abs(nose.y - eye_center_y) / max(abs(chin.y - forehead.y), 1e-6), 1.0)
             self.snapshot.gaze = gaze_state(horizontal_ratio, vertical_ratio)
 
-            left_shoulder = landmarks[11]
-            right_shoulder = landmarks[123]
-            shoulder_distance = abs(left_shoulder.x - right_shoulder.x)
-            face_height = abs(forehead.y - chin.y)
-            self.snapshot.posture = posture_state(face_height, shoulder_distance)
+            self.snapshot.posture = "unknown"
         except (ImportError, AttributeError, TypeError, ValueError):
             self.snapshot.face_present = False
             self.snapshot.gaze = "looking_away"
             self.snapshot.head_pose = "unknown"
             self.snapshot.posture = "unknown"
+            self._eyes_were_closed = False
         return self.snapshot

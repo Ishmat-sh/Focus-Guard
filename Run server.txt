@@ -1,19 +1,35 @@
 MAC
 
+Terminal 1 - Backend
 cd /path/to/Focus-Guard
-source .venv/bin/activate
-uvicorn backend.main:app --reload
+.venv/bin/python -m uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 
+The default database is the project-root focus_guard.db. To select another database,
+set FOCUS_GUARD_DB_PATH to its absolute path before starting the backend.
+
+Terminal 2 - Frontend
 cd /path/to/Focus-Guard/frontend
-npm run dev
+npm run dev -- --host 0.0.0.0
+
+On another device connected to the same trusted Wi-Fi, open:
+http://<MAC-LAN-IP>:5173
+
+Find the Mac LAN IP with: ipconfig getifaddr en0
+Allow ports 5173 and 8000 through the Mac firewall if prompted.
+Remote browser camera access requires HTTPS; plain HTTP on a LAN IP is not a secure browser context.
+For non-local networks, use HTTPS and configure FOCUS_GUARD_CORS_ORIGINS.
 
 
 WINDOWS
 
+Terminal 1 - Backend
 cd C:\path\to\Focus-Guard
-.venv\Scripts\activate
-uvicorn backend.main:app --reload
+.venv\Scripts\python -m uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 
+Terminal 2 - Frontend
 cd C:\path\to\Focus-Guard\frontend
-npm run dev
+npm run dev -- --host 0.0.0.0
+
+On another device connected to the same trusted Wi-Fi, open:
+http://<WINDOWS-LAN-IP>:5173
 ok

@@ -51,6 +51,16 @@ def test_vision_helpers() -> None:
     assert posture_state(1.0, 1.0) == "upright"
 
 
+def test_blink_counter_counts_transitions_and_expires_after_one_minute() -> None:
+    analyzer = FaceAnalyzer()
+
+    assert analyzer._record_blink_state(True, 0.0) == 0
+    assert analyzer._record_blink_state(False, 0.2) == 1
+    assert analyzer._record_blink_state(True, 1.0) == 1
+    assert analyzer._record_blink_state(False, 1.2) == 2
+    assert analyzer._record_blink_state(False, 62.0) == 0
+
+
 def test_face_analyzer_uses_landmarks_for_face_detection_and_gaze(monkeypatch) -> None:
     class FakeLandmark:
         def __init__(self, x: float, y: float) -> None:
@@ -103,4 +113,16 @@ def test_face_analyzer_uses_landmarks_for_face_detection_and_gaze(monkeypatch) -
     assert snapshot.face_present is True
     assert snapshot.head_pose in {"forward", "left", "right", "up", "down"}
     assert snapshot.gaze == "looking_at_screen"
-    assert snapshot.posture in {"upright", "slouched", "unknown"}
+    assert snapshot.posture == "unknown"
+
+
+def test_unknown_posture_does_not_lower_attention_score() -> None:
+    scorer = AttentionScorer()
+
+    result = scorer.score(
+        VisionSignals(face_present=True, looking_at_screen=True, upright=None),
+        AppCategory.PRODUCTIVE.value,
+        "Code",
+    )
+
+    assert result.score == 100.0

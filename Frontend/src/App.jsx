@@ -1,10 +1,35 @@
 import { useState, useEffect } from "react";
 
-const API = "http://localhost:8000";
+const API = (
+  import.meta.env.VITE_API_URL ||
+  `${window.location.protocol}//${window.location.hostname}:8000`
+).replace(/\/$/, "");
 
 function App() {
   const [page, setPage] = useState("home");
+  const [userAuth, setUserAuth] = useState(null);
   const [adminCredentials, setAdminCredentials] = useState(null);
+
+  async function apiFetch(path, options = {}) {
+    const headers = new Headers(options.headers || {});
+    if (userAuth?.access_token) {
+      headers.set("Authorization", `Bearer ${userAuth.access_token}`);
+    }
+    return fetch(`${API}${path}`, { ...options, headers });
+  }
+
+  async function logoutUser() {
+    if (userAuth?.access_token) {
+      await apiFetch("/sessions/end", { method: "POST" }).catch(() => {});
+      await apiFetch("/auth/logout", { method: "POST" }).catch(() => {});
+    }
+    if (window.cameraStream) {
+      window.cameraStream.getTracks().forEach((track) => track.stop());
+      window.cameraStream = null;
+    }
+    setUserAuth(null);
+    setPage("home");
+  }
 
   // =====================================================
   // HOME PAGE
@@ -58,6 +83,7 @@ function App() {
         });
         const result = await response.json();
         if (!response.ok) throw new Error(result.detail || "Could not create account");
+        setUserAuth(result);
         setPage("camera");
       } catch (error) {
         alert(error.message || "Could not connect to the server");
@@ -133,7 +159,8 @@ function App() {
         });
         const result = await response.json();
         if (!response.ok) throw new Error(result.detail || "Could not sign in");
-        setPage("camera");
+        setUserAuth(result);
+        setPage(result.user.must_change_password ? "changePassword" : "camera");
       } catch (error) {
         alert(error.message || "Could not connect to the server");
       }
@@ -246,6 +273,65 @@ function App() {
     );
   }
 
+  function ChangePassword() {
+    const [password, setPassword] = useState("");
+    const [confirmation, setConfirmation] = useState("");
+    const [error, setError] = useState("");
+
+    async function submit(e) {
+      e.preventDefault();
+      if (password.length < 8) {
+        setError("Password must be at least 8 characters");
+        return;
+      }
+      if (password !== confirmation) {
+        setError("Passwords do not match");
+        return;
+      }
+      try {
+        const response = await apiFetch("/auth/change-password", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ new_password: password }),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Could not change password");
+        setUserAuth(result);
+        setPage("camera");
+      } catch (changeError) {
+        setError(changeError.message || "Could not connect to the server");
+      }
+    }
+
+    return (
+      <div className="page">
+        <h2>Choose a new password</h2>
+        <p>Your temporary password has to be replaced before continuing.</p>
+        {error && <p className="error-banner">{error}</p>}
+        <form onSubmit={submit}>
+          <input
+            type="password"
+            placeholder="New password (8+ characters)"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            required
+            minLength={8}
+          />
+          <input
+            type="password"
+            placeholder="Confirm new password"
+            value={confirmation}
+            onChange={(event) => setConfirmation(event.target.value)}
+            required
+            minLength={8}
+          />
+          <button type="submit">Update password</button>
+        </form>
+        <button onClick={logoutUser}>Log out</button>
+      </div>
+    );
+  }
+
   // =====================================================
   // CAMERA ACCESS
   // =====================================================
@@ -271,6 +357,10 @@ function App() {
 
         alert("Camera access denied.");
       }
+    }
+
+    async function leaveCamera() {
+      await logoutUser();
     }
 
     return (
@@ -302,7 +392,7 @@ function App() {
 
         <br />
 
-        <button onClick={() => setPage("home")}>
+        <button onClick={leaveCamera}>
           Back
         </button>
       </div>
@@ -325,14 +415,13 @@ function App() {
 
       face_present: false,
       blink_count: 0,
-      blink_frequency: 0,
       gaze: "Unknown",
       head_pose: "Unknown",
-      posture: "Unknown",
       vision_score: 0,
     });
 
     const [history, setHistory] = useState([]);
+    const [hasAttention, setHasAttention] = useState(false);
 
     const [error, setError] = useState("");
 
@@ -359,10 +448,7 @@ function App() {
     // -------------------------------------------------
 
     async function request(path, options = {}) {
-      const response = await fetch(
-        `${API}${path}`,
-        options
-      );
+      const response = await apiFetch(path, options);
 
       if (!response.ok) {
         let message = "Request failed";
@@ -384,7 +470,7 @@ function App() {
     async function requestAttention() {
       const video = document.getElementById("camera");
       if (!video || video.readyState < 2 || !video.videoWidth) {
-        return request("/attention");
+        return null;
       }
 
       const canvas = document.createElement("canvas");
@@ -394,7 +480,7 @@ function App() {
       const frame = await new Promise((resolve) =>
         canvas.toBlob(resolve, "image/jpeg", 0.7)
       );
-      if (!frame) return request("/attention");
+      if (!frame) return null;
       return request("/attention/frame", {
         method: "POST",
         headers: { "Content-Type": "image/jpeg" },
@@ -408,22 +494,18 @@ function App() {
 
     async function refresh() {
       try {
-        const [
-          current,
-          live,
-          past,
-        ] = await Promise.all([
+        const [current, past] = await Promise.all([
           request("/sessions/current"),
-          requestAttention(),
           request("/history"),
         ]);
+        const live = current.state === "running" ? await requestAttention() : null;
 
         setSession(current);
 
-        setAttention((old) => ({
-          ...old,
-          ...live,
-        }));
+        if (live) {
+          setAttention((old) => ({ ...old, ...live }));
+          setHasAttention(true);
+        }
 
         setHistory(past);
 
@@ -433,9 +515,7 @@ function App() {
       } catch (requestError) {
         console.log(requestError);
 
-        setError(
-          "Backend offline. Start FastAPI on port 8000."
-        );
+        setError(requestError.message || "Could not load dashboard data");
 
         setLoading(false);
       }
@@ -446,14 +526,17 @@ function App() {
     // -------------------------------------------------
 
     useEffect(() => {
-      refresh();
-
-      const interval = setInterval(
-        refresh,
-        1000
-      );
-
-      return () => clearInterval(interval);
+      let cancelled = false;
+      let timer;
+      async function poll() {
+        await refresh();
+        if (!cancelled) timer = setTimeout(poll, 1000);
+      }
+      poll();
+      return () => {
+        cancelled = true;
+        clearTimeout(timer);
+      };
     }, []);
 
     // -------------------------------------------------
@@ -531,10 +614,7 @@ function App() {
             Focus Guard
           </h2>
           <button
-            onClick={() => {
-              stopCamera();
-              setPage("home");
-            }}
+            onClick={logoutUser}
           >
             Logout
           </button>
@@ -579,18 +659,18 @@ function App() {
           <div className="metrics">
             <div className="box">
               <h3>
-                Score
+                Estimated score
               </h3>
               <p className="big-number">
-                {score}
+                {hasAttention ? score : "—"}
               </p>
             </div>
             <div className="box">
               <h3>
-                State
+                Estimated state
               </h3>
               <p>
-                {attention.state}
+                {hasAttention ? attention.state : "Not available"}
               </p>
             </div>
             <div className="box">
@@ -607,7 +687,7 @@ function App() {
                 Vision
               </h3>
               <p>
-                {visionScore}%
+                {hasAttention ? `${visionScore}%` : "—"}
               </p>
             </div>
           </div>
@@ -615,6 +695,7 @@ function App() {
           <div className="session-controls">
             <button
               className="start-button"
+              disabled={session.state === "running" || session.state === "paused"}
               onClick={() =>
                 action(
                   "/sessions/start"
@@ -624,6 +705,7 @@ function App() {
               Start
             </button>
             <button
+              disabled={!['running', 'paused'].includes(session.state)}
               onClick={() =>
                 action(
                   session.state ===
@@ -640,6 +722,7 @@ function App() {
             </button>
             <button
               className="end-button"
+              disabled={!['running', 'paused'].includes(session.state)}
               onClick={async () => {
                 try {
                   await request(
@@ -685,26 +768,12 @@ function App() {
                 </strong>
               </div>
               <div className="vision-box">
-                <span>
-                  Blink Count
-                </span>
-                <strong>
-                  {attention.blink_count ??
-                    0}
-                </strong>
+                <span>Blinks in last minute</span>
+                <strong>{attention.blink_count ?? 0}</strong>
               </div>
               <div className="vision-box">
                 <span>
-                  Blink Frequency
-                </span>
-                <strong>
-                  {attention.blink_frequency ??
-                    0}
-                </strong>
-              </div>
-              <div className="vision-box">
-                <span>
-                  Gaze
+                  Estimated gaze
                 </span>
                 <strong>
                   {attention.gaze ||
@@ -713,7 +782,7 @@ function App() {
               </div>
               <div className="vision-box">
                 <span>
-                  Head Pose
+                  Estimated head pose
                 </span>
                 <strong>
                   {attention.head_pose ||
@@ -721,13 +790,8 @@ function App() {
                 </strong>
               </div>
               <div className="vision-box">
-                <span>
-                  Posture
-                </span>
-                <strong>
-                  {attention.posture ||
-                    "Unknown"}
-                </strong>
+                <span>Posture</span>
+                <strong>Not measured</strong>
               </div>
             </div>
           </div>
@@ -780,10 +844,8 @@ function App() {
     useEffect(() => {
       async function loadSummary() {
         try {
-          const response =
-            await fetch(
-              `${API}/history`
-            );
+          const response = await apiFetch("/history");
+          if (!response.ok) throw new Error("Could not load session history");
           const data =
             await response.json();
           if (
@@ -865,11 +927,7 @@ function App() {
           Back to Dashboard
         </button>
         <br />
-        <button
-          onClick={() =>
-            setPage("home")
-          }
-        >
+        <button onClick={logoutUser}>
           Logout
         </button>
       </div>
@@ -880,6 +938,46 @@ function App() {
     const [users, setUsers] = useState([]);
     const [admins, setAdmins] = useState([]);
     const [error, setError] = useState("");
+    const [resetPassword, setResetPassword] = useState(null);
+
+    async function resetUserPassword(user) {
+      if (!window.confirm(`Reset the password for ${user.name}? They will be signed out and must choose a new password.`)) {
+        return;
+      }
+      const authorization = `Basic ${btoa(`${adminCredentials.username}:${adminCredentials.password}`)}`;
+      try {
+        const response = await fetch(`${API}/admin/users/${user.id}/password-reset`, {
+          method: "POST",
+          headers: { Authorization: authorization },
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Could not reset password");
+        setResetPassword({ id: user.id, name: user.name, password: result.temporary_password });
+        setError("");
+      } catch (resetError) {
+        setError(resetError.message || "Could not reset password");
+      }
+    }
+
+    async function deleteUser(user) {
+      if (!window.confirm(`Permanently delete ${user.name} and all of their sessions? This cannot be undone.`)) {
+        return;
+      }
+      const authorization = `Basic ${btoa(`${adminCredentials.username}:${adminCredentials.password}`)}`;
+      try {
+        const response = await fetch(`${API}/admin/users/${user.id}`, {
+          method: "DELETE",
+          headers: { Authorization: authorization },
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Could not delete user");
+        setUsers((current) => current.filter((item) => item.id !== user.id));
+        setResetPassword((current) => current?.id === user.id ? null : current);
+        setError("");
+      } catch (deleteError) {
+        setError(deleteError.message || "Could not delete user");
+      }
+    }
 
     useEffect(() => {
       if (!adminCredentials) {
@@ -922,6 +1020,16 @@ function App() {
             Registered account details.
           </p>
           {error && <p className="error-banner">{error}</p>}
+          {resetPassword && (
+            <div className="reset-password-result" role="status">
+              <div>
+                Temporary password for <strong>{resetPassword.name}</strong>
+                <code>{resetPassword.password}</code>
+                <small>This is shown once. The user must change it at sign-in.</small>
+              </div>
+              <button onClick={() => setResetPassword(null)} aria-label="Dismiss temporary password">Dismiss</button>
+            </div>
+          )}
           <table>
             <thead>
               <tr>
@@ -933,15 +1041,20 @@ function App() {
                   Email
                 </th>
                 <th>Registered</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
-              {users.length === 0 ? <tr><td colSpan="4">No registered users</td></tr> : users.map((user) => (
+              {users.length === 0 ? <tr><td colSpan="5">No registered users</td></tr> : users.map((user) => (
                 <tr key={user.id}>
                   <td>{user.id}</td>
                   <td>{user.name}</td>
                   <td>{user.email}</td>
                   <td>{user.created_at ? new Date(user.created_at * 1000).toLocaleString() : "—"}</td>
+                  <td>
+                    <button onClick={() => resetUserPassword(user)}>Reset password</button>
+                    <button className="delete-user-button" onClick={() => deleteUser(user)}>Delete user</button>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -966,6 +1079,9 @@ function App() {
   }
   if (page === "login") {
     return <Login />;
+  }
+  if (page === "changePassword") {
+    return <ChangePassword />;
   }
   if (page === "admin") {
     return <AdminLogin />;
