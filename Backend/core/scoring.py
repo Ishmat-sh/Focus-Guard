@@ -16,7 +16,7 @@ class AttentionState(str, Enum):
 class VisionSignals:
     face_present: bool = False
     looking_at_screen: bool = False
-    upright: bool = True
+    upright: bool | None = True
     blink_rate: float = 0.0
 
 
@@ -40,7 +40,7 @@ class AttentionScorer:
             raw -= 45
         if not vision.looking_at_screen:
             raw -= 30
-        if not vision.upright:
+        if vision.upright is False:
             raw -= 15
         if app_category == "distracting":
             raw -= 35

@@ -6,6 +6,7 @@ import hmac
 import secrets
 import sqlite3
 from pathlib import Path
+from time import time
 from typing import Any
 
 
@@ -13,14 +14,18 @@ class Database:
     _PASSWORD_ITERATIONS = 310_000
 
     def __init__(self, path: str | Path = "focus_guard.db") -> None:
-        self.path = str(path)
+        requested_path = Path(path)
+        if requested_path == Path("focus_guard.db"):
+            requested_path = Path(__file__).resolve().parents[2] / "focus_guard.db"
+        self.path = str(requested_path)
         self.connection = sqlite3.connect(self.path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS sessions (
-                id INTEGER PRIMARY KEY, started_at REAL NOT NULL, ended_at REAL,
+                id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+                started_at REAL NOT NULL, ended_at REAL,
                 elapsed_seconds REAL NOT NULL, state TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS telemetry (
@@ -34,6 +39,7 @@ class Database:
                 name TEXT NOT NULL,
                 email TEXT NOT NULL UNIQUE,
                 password TEXT NOT NULL,
+                must_change_password INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL DEFAULT (strftime('%s', 'now'))
             );
             CREATE TABLE IF NOT EXISTS admins (
@@ -43,22 +49,42 @@ class Database:
                 email TEXT,
                 created_at REAL NOT NULL DEFAULT (strftime('%s', 'now'))
             );
+            CREATE TABLE IF NOT EXISTS user_tokens (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                expires_at REAL NOT NULL
+            );
             """
         )
+        session_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(sessions)")
+        }
+        if "user_id" not in session_columns:
+            self.connection.execute(
+                "ALTER TABLE sessions ADD COLUMN user_id INTEGER REFERENCES users(id)"
+            )
+        user_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(users)")
+        }
+        if "must_change_password" not in user_columns:
+            self.connection.execute(
+                "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0"
+            )
         self.connection.commit()
 
-    def save_session(self, session: Any) -> None:
+    def save_session(self, session: Any, user_id: int | None = None) -> None:
         self.connection.execute(
             """
-            INSERT INTO sessions (id, started_at, ended_at, elapsed_seconds, state)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO sessions (id, user_id, started_at, ended_at, elapsed_seconds, state)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
+                user_id = COALESCE(excluded.user_id, sessions.user_id),
                 started_at = excluded.started_at,
                 ended_at = excluded.ended_at,
                 elapsed_seconds = excluded.elapsed_seconds,
                 state = excluded.state
             """,
-            (session.id, session.started_at, session.ended_at, session.elapsed_seconds, session.state.value),
+            (session.id, user_id, session.started_at, session.ended_at, session.elapsed_seconds, session.state.value),
         )
         self.connection.commit()
 
@@ -79,12 +105,17 @@ class Database:
         except sqlite3.IntegrityError as error:
             raise ValueError("An account with this email already exists") from error
         self.connection.commit()
-        return {"id": cursor.lastrowid, "name": name.strip(), "email": normalized_email}
+        return {
+            "id": cursor.lastrowid,
+            "name": name.strip(),
+            "email": normalized_email,
+            "must_change_password": False,
+        }
 
     def verify_user(self, email: str, password: str) -> dict[str, Any] | None:
         normalized_email = email.strip().lower()
         row = self.connection.execute(
-            "SELECT id, name, email, password FROM users WHERE email = ? LIMIT 1",
+            "SELECT id, name, email, password, must_change_password FROM users WHERE email = ? LIMIT 1",
             (normalized_email,),
         ).fetchone()
         if row is None or not self._verify_password(password, row["password"]):
@@ -96,7 +127,96 @@ class Database:
                 (self._hash_password(password), row["id"]),
             )
             self.connection.commit()
-        return {"id": row["id"], "name": row["name"], "email": row["email"]}
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "email": row["email"],
+            "must_change_password": bool(row["must_change_password"]),
+        }
+
+    def reset_user_password(self, user_id: int) -> str | None:
+        temporary_password = secrets.token_urlsafe(12)
+        cursor = self.connection.execute(
+            "UPDATE users SET password = ?, must_change_password = 1 WHERE id = ?",
+            (self._hash_password(temporary_password), user_id),
+        )
+        if cursor.rowcount == 0:
+            self.connection.rollback()
+            return None
+        self.connection.execute("DELETE FROM user_tokens WHERE user_id = ?", (user_id,))
+        self.connection.commit()
+        return temporary_password
+
+    def change_user_password(self, user_id: int, new_password: str) -> dict[str, Any] | None:
+        cursor = self.connection.execute(
+            "UPDATE users SET password = ?, must_change_password = 0 WHERE id = ?",
+            (self._hash_password(new_password), user_id),
+        )
+        if cursor.rowcount == 0:
+            self.connection.rollback()
+            return None
+        self.connection.execute("DELETE FROM user_tokens WHERE user_id = ?", (user_id,))
+        row = self.connection.execute(
+            "SELECT id, name, email, must_change_password FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        self.connection.commit()
+        if row is None:
+            return None
+        return dict(row) | {"must_change_password": bool(row["must_change_password"])}
+
+    def delete_user(self, user_id: int) -> bool:
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            exists = self.connection.execute(
+                "SELECT 1 FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if exists is None:
+                self.connection.rollback()
+                return False
+            self.connection.execute(
+                "DELETE FROM telemetry WHERE session_id IN "
+                "(SELECT id FROM sessions WHERE user_id = ?)",
+                (user_id,),
+            )
+            self.connection.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            self.connection.execute("DELETE FROM user_tokens WHERE user_id = ?", (user_id,))
+            self.connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def issue_user_token(self, user_id: int, lifetime_seconds: int = 86_400) -> str:
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        self.connection.execute(
+            "INSERT INTO user_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+            (token_hash, user_id, time() + lifetime_seconds),
+        )
+        self.connection.commit()
+        return token
+
+    def get_user_for_token(self, token: str) -> dict[str, Any] | None:
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        row = self.connection.execute(
+            """
+            SELECT users.id, users.name, users.email, users.must_change_password
+            FROM user_tokens
+            JOIN users ON users.id = user_tokens.user_id
+            WHERE user_tokens.token_hash = ? AND user_tokens.expires_at > ?
+            """,
+            (token_hash, time()),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row) | {"must_change_password": bool(row["must_change_password"])}
+
+    def revoke_user_token(self, token: str) -> None:
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        self.connection.execute("DELETE FROM user_tokens WHERE token_hash = ?", (token_hash,))
+        self.connection.commit()
 
     @classmethod
     def _hash_password(cls, password: str) -> str:
@@ -109,7 +229,9 @@ class Database:
         )
 
     @staticmethod
-    def _verify_password(password: str, encoded: str) -> bool:
+    def _verify_password(password: str, encoded: str | None) -> bool:
+        if not isinstance(encoded, str):
+            return False
         if not encoded.startswith("pbkdf2_sha256$"):
             return hmac.compare_digest(password, encoded)
         try:
@@ -236,6 +358,13 @@ class Database:
 
     def history(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.connection.execute("SELECT * FROM sessions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def user_history(self, user_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM sessions WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
         return [dict(row) for row in rows]
 
     def next_session_id(self) -> int:
