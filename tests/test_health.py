@@ -20,6 +20,34 @@ def test_health_check() -> None:
     assert response.json() == {"status": "ok"}
 
 
+def test_database_explorer_endpoints_are_read_only_and_paginated() -> None:
+    client = TestClient(app)
+
+    assert client.get("/admin/database/tables").status_code == 401
+
+    tables_response = client.get("/admin/database/tables", auth=("admin", "admin123"))
+    assert tables_response.status_code == 200
+    assert {table["name"] for table in tables_response.json()} >= {
+        "sessions",
+        "telemetry",
+        "users",
+        "admins",
+    }
+
+    table_response = client.get(
+        "/admin/database/tables/users?limit=1&offset=0",
+        auth=("admin", "admin123"),
+    )
+    assert table_response.status_code == 200
+    assert table_response.json()["name"] == "users"
+    assert "columns" in table_response.json()
+    assert len(table_response.json()["rows"]) <= 1
+    assert client.get(
+        "/admin/database/tables/not_a_table",
+        auth=("admin", "admin123"),
+    ).status_code == 404
+
+
 def test_focus_status_endpoint() -> None:
     response = TestClient(app).get("/focus-status")
 
