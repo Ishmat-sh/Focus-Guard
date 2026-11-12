@@ -30,11 +30,7 @@ function App() {
     setUserAuth(null);
     setPage("home");
   }
-
-  // =====================================================
   // HOME PAGE
-  // =====================================================
-
   function Home() {
     return (
       <div className="page">
@@ -63,10 +59,7 @@ function App() {
       </div>
     );
   }
-
-  // =====================================================
   // SIGN UP
-  // =====================================================
 
   function Signup() {
     const [name, setName] = useState("");
@@ -140,10 +133,7 @@ function App() {
       </div>
     );
   }
-
-  // =====================================================
   // USER LOGIN
-  // =====================================================
 
   function Login() {
     const [email, setEmail] = useState("");
@@ -208,10 +198,7 @@ function App() {
       </div>
     );
   }
-
-  // =====================================================
   // ADMIN LOGIN
-  // =====================================================
 
   function AdminLogin() {
     const [username, setUsername] = useState("");
@@ -331,10 +318,7 @@ function App() {
       </div>
     );
   }
-
-  // =====================================================
-  // CAMERA ACCESS
-  // =====================================================
+  // CAMERA ACCESs
 
   function Camera() {
     const [cameraEnabled, setCameraEnabled] =
@@ -398,10 +382,7 @@ function App() {
       </div>
     );
   }
-
-  // =====================================================
   // DASHBOARD
-  // =====================================================
 
   function Dashboard() {
     const [session, setSession] = useState({
@@ -426,10 +407,7 @@ function App() {
     const [error, setError] = useState("");
 
     const [loading, setLoading] = useState(true);
-
-    // -------------------------------------------------
     // STOP CAMERA
-    // -------------------------------------------------
 
     function stopCamera() {
       if (window.cameraStream) {
@@ -442,10 +420,7 @@ function App() {
         window.cameraStream = null;
       }
     }
-
-    // -------------------------------------------------
     // GET DATA FROM BACKEND
-    // -------------------------------------------------
 
     async function request(path, options = {}) {
       const response = await apiFetch(path, options);
@@ -487,10 +462,7 @@ function App() {
         body: frame,
       });
     }
-
-    // -------------------------------------------------
     // REFRESH DATA
-    // -------------------------------------------------
 
     async function refresh() {
       try {
@@ -520,11 +492,7 @@ function App() {
         setLoading(false);
       }
     }
-
-    // -------------------------------------------------
     // START API POLLING
-    // -------------------------------------------------
-
     useEffect(() => {
       let cancelled = false;
       let timer;
@@ -538,11 +506,7 @@ function App() {
         clearTimeout(timer);
       };
     }, []);
-
-    // -------------------------------------------------
     // CAMERA DISPLAY
-    // -------------------------------------------------
-
     useEffect(() => {
       const video =
         document.getElementById("camera");
@@ -582,10 +546,7 @@ function App() {
         );
       }
     }
-
-    // -------------------------------------------------
     // BACKEND SESSION TIME
-    // -------------------------------------------------
 
     const elapsed =
       session.elapsed_seconds || 0;

@@ -253,7 +253,17 @@ def test_database_explorer_lists_tables_and_redacts_sensitive_columns(tmp_path) 
     users = database.inspect_table("users", limit=1)
 
     assert {table["name"] for table in tables} == {
-        "sessions", "telemetry", "users", "admins", "user_tokens"
+        "sessions",
+        "telemetry",
+        "users",
+        "admins",
+        "user_tokens",
+        "schema_migrations",
+        "collection_consents",
+        "feature_windows",
+        "labels",
+        "model_versions",
+        "user_privacy_settings",
     }
     assert users["total"] == 1
     assert users["rows"][0]["email"] == "alice@example.com"
@@ -270,3 +280,47 @@ def test_database_explorer_rejects_unknown_tables(tmp_path) -> None:
         assert "Unknown table" in str(error)
     else:
         raise AssertionError("unknown tables should not be queryable")
+
+
+def test_model_registry_keeps_one_active_version_and_round_trips_metrics(tmp_path) -> None:
+    database = Database(tmp_path / "focus_guard.db")
+
+    database.register_model_version("focus_guard", "v1", {"macro_f1": 0.7}, "v1.joblib", 1.0)
+    database.register_model_version("focus_guard", "v2", {"macro_f1": 0.8}, "v2.joblib", 2.0)
+
+    active = database.active_model_version("focus_guard")
+    all_versions = database.connection.execute(
+        "SELECT version, is_active FROM model_versions ORDER BY version"
+    ).fetchall()
+    assert active is not None
+    assert active["version"] == "v2"
+    assert active["metrics"] == {"macro_f1": 0.8}
+    assert [(row["version"], row["is_active"]) for row in all_versions] == [
+        ("v1", 0),
+        ("v2", 1),
+    ]
+
+
+def test_retention_policy_deletes_only_expired_telemetry_for_its_user(tmp_path) -> None:
+    database = Database(tmp_path / "focus_guard.db")
+    first = database.create_user("First", "first@example.com", "first-password")
+    second = database.create_user("Second", "second@example.com", "second-password")
+    first_session = Session(id=1, state=SessionState.RUNNING, started_at=100.0)
+    second_session = Session(id=2, state=SessionState.RUNNING, started_at=100.0)
+    result = AttentionResult(80.0, AttentionState.FOCUSED, 80.0, "Code", "productive")
+    database.save_session(first_session, first["id"])
+    database.save_session(second_session, second["id"])
+    database.save_telemetry(1, 100.0, result, True)
+    database.save_telemetry(2, 100.0, result, True)
+    database.set_retention_days(first["id"], 1)
+
+    deleted = database.apply_retention_policy(first["id"], now=100.0 + 86_401)
+
+    assert deleted == 1
+    assert database.connection.execute(
+        "SELECT COUNT(*) FROM telemetry WHERE session_id = 1"
+    ).fetchone()[0] == 0
+    assert database.connection.execute(
+        "SELECT COUNT(*) FROM telemetry WHERE session_id = 2"
+    ).fetchone()[0] == 1
+    assert database.retention_days(second["id"]) is None

@@ -1,152 +1,178 @@
-Focus Guard – Backend Milestone Summary
+FOCUS GUARD - VIVA PREPARATION NOTES
 
-Project structure:
-- backend/: main API and logic modules
-- frontend/: React dashboard
-- tests/: backend validation tests
-- requirements.txt: dependencies
-- pyproject.toml: project config
+1. Project purpose
+Focus Guard ek focus-monitoring application hai jo user ke attention level ko estimate karne ke liye design kiya gaya hai. System user signup/login, focus session tracking, uploaded webcam frames ka analysis, heuristic attention scoring, distraction alerts, aur saved session history provide karta hai. Frontend React app backend se API ke through communicate karta hai, aur backend FastAPI service auth, validation, session logic, scoring, aur database handling manage karta hai.
 
-Libraries used:
-- FastAPI: REST API framework for backend endpoints
-- Uvicorn: ASGI server to run the FastAPI app
-- Pytest: backend testing framework
-- HTTPX: used by FastAPI test client setup
-- NumPy: numerical helper operations
-- OpenCV (opencv-python): webcam capture and frame handling
-- MediaPipe: face landmark extraction and face mesh analysis
-- SQLite3: local database persistence
-- React + Vite: frontend dashboard
-- Tailwind CSS: frontend styling
+2. End-to-end architecture
+- Frontend: React + Vite UI for signup, login, dashboard, and session flow.
+- Backend: Python + FastAPI server for request handling, auth, scoring, and API responses.
+- Storage: SQLite database stores users, admins, tokens, sessions, and telemetry.
+- Vision layer: OpenCV + MediaPipe Face Mesh used to extract face landmarks from uploaded frames.
+- Scoring layer: rule-based attention logic converts those signals into a focus state like focused, drifting, distracted, or fatigued.
 
-Milestone 1 — Project setup + architecture + environment
-- Created a clean modular structure with backend/, frontend/, tests/.
-- Installed Python dependencies for FastAPI, NumPy, OpenCV, MediaPipe, and pytest.
-- Set up the app architecture around the backend API, session logic, context detection, scoring engine, and database layer.
-- Verified project startup readiness by making sure the backend can run and the frontend can compile.
+3. Technologies used
+- Python: main backend language
+- FastAPI: REST API and request handling
+- Pydantic: request/response validation
+- Uvicorn: ASGI server to run the app
+- SQLite: lightweight local database
+- OpenCV: image decoding and preprocessing
+- NumPy: converting image bytes for CV processing
+- MediaPipe Face Mesh: landmark detection
+- pytest: testing framework
+- HTTPX / TestClient: API testing
 
-Milestone 2 — Session Manager + stopwatch
-- Built SessionManager in backend/core/session.py.
-- Added states: IDLE → RUNNING → PAUSED → RUNNING → COMPLETED.
-- Included a stopwatch-like elapsed time tracker.
-- Supported start, pause, resume, and end actions.
-- Stored time using a monotonic clock so it is unit-testable and stable.
+4. Main modules and responsibilities
+- backend/main.py: main FastAPI app, routes, auth dependencies, CORS, runtime session objects
+- backend/core/session.py: session lifecycle and elapsed-time calculations
+- backend/core/scoring.py: attention score logic and state mapping
+- backend/core/alerts.py: distraction alert threshold and cooldown logic
+- backend/storage/database.py: user/admin/token/session/telemetry persistence and migrations
+- backend/vision/analyzer.py: EAR, blink, gaze, head-pose, and face-related calculations
+- backend/context/: app detection and categorization helpers
+- tests/: functional verification for backend logic and endpoints
 
-Milestone 3 — Webcam capture + face detection
-- Created backend/vision/capture.py for camera opening and frame reading.
-- Created backend/vision/analyzer.py for face analysis.
-- Added camera availability checks and safe frame handling.
-- Implemented a FaceAnalyzer that tries to process frames with MediaPipe Face Mesh.
-- Detects whether a face is present or missing.
+5. API workflow
+Backend app `backend.main:app` is the main FastAPI entry point. Requests pass through auth dependencies, route handlers, and business logic before returning JSON responses. FastAPI also provides automatic `/docs` documentation.
 
-Milestone 4 — Blink/EAR
-- Added eye aspect ratio (EAR) calculation logic.
-- Implemented blink detection based on thresholds.
-- Added helper functions to detect whether an eye is closed by comparing EAR against a threshold.
-- This creates the foundation for blink counting and frequency analysis.
+Important endpoints:
+- `GET /` and `GET /health`: status check
+- `POST /users`: create account; password must be minimum 8 chars
+- `POST /auth/login`: login with email/password and receive token
+- `POST /auth/change-password`: change password after reset
+- `POST /auth/logout`: revoke token
+- `GET /focus-status`: current focus status
+- `POST /sessions/start`, `/sessions/pause`, `/sessions/resume`, `/sessions/end`: session control
+- `GET /sessions/current`: current session snapshot
+- `POST /attention/frame`: analyze uploaded JPEG frame and return attention output
+- `GET /metrics` and `GET /history`: user session and history data
+- Admin routes: login, user listing, password reset, deletion, and database inspection
 
-Milestone 5 — Head pose + basic gaze
-- Added helper functions for head pose estimation:
-  - forward
-  - left
-  - right
-  - up
-  - down
-- Added basic gaze approximation using eye ratios and directional positions.
-- Detects whether the user is looking at the screen or away.
+6. Authentication and authorization
+- User routes require Bearer token authentication.
+- Admin routes use HTTP Basic authentication.
+- Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes.
+- Constant-time comparison is used during password verification.
+- Raw user tokens are never stored; only SHA-256 hashes are saved in DB.
+- Tokens expire after default 24 hours.
+- Password reset revokes old tokens and enforces a forced password change.
+- User data is filtered by `user_id` to maintain isolation between accounts.
 
-Milestone 6 — Basic posture
-- Added posture analysis using face height vs shoulder-distance logic.
-- Differentiates between upright and slouched posture.
-- This prepares the posture signal to feed into the overall attention score.
+7. Session logic
+`SessionManager` handles the session lifecycle `IDLE -> RUNNING -> PAUSED -> RUNNING -> COMPLETED`.
+- Start creates a session and sets started timestamp.
+- Pause records elapsed time and pause time.
+- Resume continues without counting paused duration as active focus time.
+- End marks session complete and finalizes elapsed time.
+- `time.monotonic()` is used for reliable elapsed-time tracking.
+- Invalid transitions raise `ValueError`, which API converts to HTTP 409 Conflict.
+- Per-user runtime session objects are protected by `RLock`.
 
-Milestone 7 — macOS active application detection
-- Implemented backend/context/macos.py using AppleScript via osascript.
-- Reads the current frontmost application name on macOS.
-- This allows the app to know whether the user is in a work app, browser, etc.
+8. Vision and attention scoring
+`POST /attention/frame` accepts JPEG image bytes. Empty input or files larger than 2 MB are rejected. OpenCV decodes the image, and `FaceAnalyzer.process()` extracts landmarks using MediaPipe Face Mesh.
 
-Milestone 8 — Windows active application detection
-- Implemented backend/context/windows.py using ctypes and Windows API calls.
-- Fetches the foreground window title/application name on Windows.
-- Returns "Unknown" on unsupported or failing environments.
+Signals extracted from the frame include:
+- Eye Aspect Ratio (EAR): open vs closed eye estimation
+- Blink detection: counts transitions and computes blink rate
+- Head pose: approximate forward/left/right/up/down orientation
+- Gaze: decides whether user is looking at the screen or away
+- Posture: estimated as upright or slouched where possible
 
-Milestone 9 — Application categorization
-- Created backend/context/categories.py.
-- Added categories:
-  - PRODUCTIVE
-  - NEUTRAL
-  - DISTRACTING
-  - UNKNOWN
-- Mapped app names such as VS Code, Terminal, YouTube, Discord, Safari, etc.
-- This allows the attention engine to judge whether the current app is helping or harming focus.
+This is a heuristic scoring model, not a deep learning model.
+`AttentionScorer` applies a rule-based score from 0 to 100:
+- Face absent: -45
+- Looking away from screen: -30
+- Slouched posture: -15
+- Distracting app: -35
+- Neutral app: -5
+- Unknown app: -10
+- High blink rate adds fatigue penalty
+- Last 8 raw scores are averaged to smooth noise
 
-Milestone 10 — Attention scoring engine
-- Created backend/core/scoring.py.
-- Built a rule-based scoring engine from 0 to 100.
-- Combined signals such as:
-  - face present / absent
-  - looking at screen / away
-  - posture
-  - app category
-  - blink rate
-- Score is clamped to valid range and returned as a structured result.
+Score mapping:
+- 75 and above: `focused`
+- 50 to below 75: `drifting`
+- below 50: `distracted`
+- repeated high-blink samples can push state to `fatigued`
 
-Milestone 11 — Four attention states + temporal smoothing
-- Added attention states:
-  - FOCUSED
-  - DRIFTING
-  - DISTRACTED
-  - FATIGUED
-- Used smoothing with a deque to average recent score values.
-- Prevents noisy single-frame jumps from causing flickering state changes.
-- Makes state transitions more realistic and stable.
+Important honest point: current scoring is approximate and rule-based. It is functional as a prototype, but it is not yet highly accurate in real-world conditions because no DL/ML model is integrated.
 
-Milestone 12 — Persistent distraction + alerts
-- Implemented backend/core/alerts.py.
-- Alert logic detects sustained distraction over time rather than brief distraction.
-- Includes cooldown to avoid repeated alert spam.
-- Stops resetting when the session is paused or ended.
+9. Alerts and distraction detection
+`AlertManager` watches repeated distraction states while a session is active. By default, alert is triggered after distraction persists for a defined interval, and cooldown prevents repeated alerts too quickly. If no session is active, the distraction timer resets.
 
-Milestone 13 — SQLite database
-- Created backend/storage/database.py.
-- Added SQLite tables for:
-  - sessions
-  - telemetry
-- Stores session metadata and time-based attention results.
-- Ensures no raw webcam frames are saved.
-- This gives the app persistent records for later analysis and history views.
+10. SQLite database design
+The project uses SQLite with the database file at project root named `focus_guard.db`. `FOCUS_GUARD_DB_PATH` can override the location. Foreign keys are enabled and the connection uses `check_same_thread=False`.
 
-Milestone 14 — FastAPI integration
-- Wired everything into backend/main.py.
-- Added endpoints for:
-  - session start
-  - pause
-  - resume
-  - end
-  - current session status
-  - attention score
-  - metrics
-  - saved history
-- Added CORS support so the frontend can talk to the backend on localhost.
-- Exposed all logic through a clean REST API.
+Tables include:
+- `users`: user profile, email, password hash, and password-change flag
+- `admins`: admin credentials
+- `user_tokens`: token hash, user id, and expiry
+- `sessions`: session metadata including start/end time, elapsed seconds, and state
+- `telemetry`: per-frame score/state and app metadata for a session
 
-How everything fits together:
-1. The session manager controls whether the user is active, paused, or ended.
-2. The webcam and MediaPipe layer detects face presence and landmarks.
-3. EAR, gaze, posture, and head pose helpers convert landmark data into behavioral signals.
-4. The app context detector finds the active application on macOS/Windows.
-5. The app categorizer labels it as productive, neutral, distracting, or unknown.
-6. The attention scorer combines all of these signals into a score from 0 to 100.
-7. The state logic smooths the score into FOCUSED/DRIFTING/DISTRACTED/FATIGUED.
-8. The alert manager fires only after sustained distraction and cooldown rules are satisfied.
-9. The SQLite database stores session and telemetry data.
-10. FastAPI exposes this data to the frontend dashboard.
-11. The frontend React app polls the backend and shows session time, state, score, app name, and history.
+Important notes:
+- Raw camera frames are not stored.
+- Telemetry stores processed metadata, not actual images.
+- `session_id` is a foreign key, and updates are done with upsert logic.
+- User deletion removes related telemetry, sessions, tokens, and account records.
+- Old schema migrations handle missing `user_id` and `must_change_password` columns.
+- Admin database inspection redacts sensitive values.
 
-Current status:
-- Core backend logic, scoring, alerts, persistent storage, app context, and API integration are implemented.
-- Webcam/live signal processing is partially structured and helper logic exists.
-- Full live camera-driven milestone verification still requires a real webcam environment to test on a machine with a camera available.
+11. Application context and active app detection
+The app context system maps applications to categories like productive, neutral, distracting, or unknown. macOS detection uses AppleScript/osascript and Windows uses WinAPI calls; if detection fails, the app is marked as unknown.
 
-Summary:
-This project now has a solid backend architecture for a focus-monitoring system: session tracking, real-time attention analysis, app detection, categorization, scoring, database persistence, and API integration. The main remaining step for full production behavior is connecting the live webcam pipeline end-to-end and validating it with actual camera data in a real environment.
+Important limitation: the live frame endpoint currently still uses `app_name = "Unknown"` and `app_category = "unknown"` in the scoring flow. So app-detection modules exist, but they are not yet fully integrated in the live scoring pipeline.
+
+12. Frontend and project flow
+The frontend is a React + Vite UI with pages for signup, login, admin login, and dashboard session flow. After login, the user starts a focus session, camera frames are uploaded to the backend, and the app displays a score or state based on the response.
+
+13. CORS and configuration
+- Frontend localhost/127.0.0.1 on port 5173 are allowed.
+- Extra origins can be passed using `FOCUS_GUARD_CORS_ORIGINS`.
+- Admin bootstrap can be created using `FOCUS_GUARD_ADMIN_USERNAME` and `FOCUS_GUARD_ADMIN_PASSWORD`.
+- Typical backend command on Mac: `.venv/bin/python -m uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000`
+
+14. Tests and validation
+The project includes automated tests in `tests/`:
+- `tests/test_core.py`: scoring rules, pause/resume logic, alert threshold, blink behavior, and mocked vision logic
+- `tests/test_database.py`: persistence, hashing, migrations, tokens, user deletion, and redaction
+- `tests/test_health.py`: health, auth, session lifecycle, frame endpoint, and admin API checks
+
+These tests do not require a real webcam; they use mocked or synthetic data.
+
+15. Current limitations and honest viva statement
+These are the important honest limitations to mention:
+- Current scoring is heuristic and not deep learning-based.
+- Face detection and blink metrics may become inaccurate under poor lighting, side angles, or low-quality frames.
+- App category is still effectively unknown in the live scoring pipeline.
+- Posture and advanced context signals are partially designed but not fully integrated in runtime flow.
+- Real-world camera validation still needs more testing on actual devices.
+
+16. Viva quick Q/A
+Q: Why use FastAPI?
+A: It provides async-friendly REST APIs, typed request validation, and fast development with automatic docs.
+
+Q: Why use `time.monotonic()`?
+A: To keep session elapsed time stable even if the system clock changes.
+
+Q: Why is scoring not fully accurate?
+A: Because it is a rule-based heuristic system and does not use a trained ML/DL model yet.
+
+Q: How are passwords stored safely?
+A: They are hashed with a random salt using PBKDF2-HMAC-SHA256.
+
+Q: Why hash user tokens?
+A: So even if the database leaks, raw bearer tokens are not directly exposed.
+
+Q: Are images stored in DB?
+A: No. Only processed telemetry metadata is stored.
+
+Q: How is user isolation handled?
+A: All session/history queries are filtered by `user_id`.
+
+Q: How are tests run without a webcam?
+A: Using fake analysis data and mock landmarks instead of real camera input.
+
+One-line summary:
+Focus Guard is a FastAPI-based focus monitoring system that combines user auth, per-user session tracking, uploaded frame analysis, rule-based attention scoring, alert logic, and SQLite history storage; however, the current scoring is heuristic and not yet ML/DL-powered, so accuracy remains limited in real-world conditions.
+

@@ -1,8 +1,10 @@
+import json
 from fastapi.testclient import TestClient
 import cv2
 import numpy as np
 import pytest
 from uuid import uuid4
+from time import sleep
 
 import backend.main as main
 from backend.storage.database import Database
@@ -19,6 +21,13 @@ def isolate_api_database(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "user_scorers", {})
     monkeypatch.setattr(main, "user_face_analyzers", {})
     monkeypatch.setattr(main, "user_alerts", {})
+    monkeypatch.setattr(main, "last_active_applications", {})
+    monkeypatch.setattr(main, "user_model_inferences", {})
+    monkeypatch.setattr(main, "user_model_errors", {})
+    monkeypatch.setattr(main, "user_frame_history", {})
+    monkeypatch.setattr(main, "user_fatigue_estimators", {})
+    monkeypatch.setattr(main, "user_fatigue_snapshots", {})
+    monkeypatch.setattr(main, "scorer_mode", "rules")
     yield test_database
     test_database.connection.close()
 
@@ -167,6 +176,7 @@ def test_attention_frame_endpoint_uses_analyzed_camera_signals(monkeypatch) -> N
             )
 
     monkeypatch.setattr("backend.main._face_analyzer_for", lambda user_id: FakeAnalyzer())
+    monkeypatch.setattr("backend.main.get_active_application", lambda: "YouTube")
     client = TestClient(app)
     headers = register_user(client, f"vision-{uuid4().hex}@example.com")
     success, encoded = cv2.imencode(".jpg", np.zeros((32, 32, 3), dtype=np.uint8))
@@ -183,6 +193,184 @@ def test_attention_frame_endpoint_uses_analyzed_camera_signals(monkeypatch) -> N
     assert response.json()["gaze"] == "looking_at_screen"
     assert response.json()["posture"] == "upright"
     assert response.json()["vision_score"] == 100
+    assert response.json()["app_category"] == "distracting"
+    assert response.json()["scorer"] == "rules"
+    assert response.json()["confidence"] is None
+
+
+def test_consent_gated_labels_and_dataset_export(monkeypatch, isolate_api_database) -> None:
+    class FakeAnalyzer:
+        def process(self, frame):
+            return VisionSnapshot(
+                face_present=True,
+                blink_count=1,
+                blink_rate=1.0,
+                ear=0.3,
+                head_pose="forward",
+                head_yaw_degrees=2.0,
+                head_pitch_degrees=1.0,
+                head_roll_degrees=0.0,
+                gaze="looking_at_screen",
+                gaze_offset_x=0.01,
+                gaze_offset_y=0.02,
+            )
+
+    monkeypatch.setattr("backend.main._face_analyzer_for", lambda user_id: FakeAnalyzer())
+    monkeypatch.setattr("backend.main.get_active_application", lambda: "YouTube")
+    client = TestClient(app)
+    headers = register_user(client, f"collection-{uuid4().hex}@example.com")
+    other_headers = register_user(client, f"other-{uuid4().hex}@example.com")
+    session_id = client.post("/sessions/start", headers=headers).json()["id"]
+
+    assert client.post(
+        f"/sessions/{session_id}/labels",
+        headers=headers,
+        json={
+            "start_elapsed_seconds": 0,
+            "end_elapsed_seconds": 0.001,
+            "label": "focused",
+        },
+    ).status_code == 409
+    assert client.post(
+        f"/sessions/{session_id}/collection/consent",
+        headers=other_headers,
+        json={"consent": True},
+    ).status_code == 404
+    consent = client.post(
+        f"/sessions/{session_id}/collection/consent",
+        headers=headers,
+        json={"consent": True},
+    )
+    assert consent.status_code == 200
+    assert consent.json()["consent"] is True
+
+    sleep(0.02)
+    success, encoded = cv2.imencode(".jpg", np.zeros((32, 32, 3), dtype=np.uint8))
+    assert success
+    frame_response = client.post(
+        "/attention/frame",
+        content=encoded.tobytes(),
+        headers={**headers, "Content-Type": "image/jpeg"},
+    )
+    assert frame_response.status_code == 200
+    assert "features" not in frame_response.json()
+    telemetry = isolate_api_database.connection.execute(
+        "SELECT app_name, app_category, features_json FROM telemetry WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    collected_features = json.loads(telemetry["features_json"])
+    assert telemetry["app_name"] == "YouTube"
+    assert telemetry["app_category"] == "distracting"
+    assert collected_features["active_app_category"] == "distracting"
+    assert "app_name" not in collected_features
+
+    label = client.post(
+        f"/sessions/{session_id}/labels",
+        headers=headers,
+        json={
+            "start_elapsed_seconds": 0,
+            "end_elapsed_seconds": 0.01,
+            "label": "focused",
+        },
+    )
+    assert label.status_code == 201
+    assert label.json()["source"] == "self_reported"
+
+    exported = client.get(
+        f"/sessions/{session_id}/dataset.csv",
+        headers=headers,
+    )
+    assert exported.status_code == 200
+    assert exported.headers["content-type"].startswith("text/csv")
+    assert "perclos" in exported.text
+    assert "focused" in exported.text
+    assert "image" not in exported.text
+    assert "frame" not in exported.text
+
+
+def test_revoking_collection_consent_deletes_collected_features_and_labels(
+    isolate_api_database,
+) -> None:
+    client = TestClient(app)
+    headers = register_user(client, f"revoke-{uuid4().hex}@example.com")
+    session_id = client.post("/sessions/start", headers=headers).json()["id"]
+    database = isolate_api_database
+    user_id = database.connection.execute(
+        "SELECT user_id FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()["user_id"]
+    database.set_collection_consent(session_id, user_id, True)
+    database.create_label(session_id, user_id, 0, 0.5, "focused")
+
+    response = client.post(
+        f"/sessions/{session_id}/collection/consent",
+        headers=headers,
+        json={"consent": False},
+    )
+
+    assert response.status_code == 200
+    assert database.collection_is_consented(session_id) is False
+    assert database.connection.execute(
+        "SELECT COUNT(*) FROM labels WHERE session_id = ?", (session_id,)
+    ).fetchone()[0] == 0
+    assert client.get(
+        f"/sessions/{session_id}/dataset.csv", headers=headers
+    ).status_code == 409
+
+
+def test_missing_trained_model_is_reported_for_rules_fallback(
+    isolate_api_database, monkeypatch
+) -> None:
+    monkeypatch.delenv("FOCUS_GUARD_MODEL_PATH", raising=False)
+
+    model = main._model_inference_for(123)
+
+    assert model is None
+    assert "No trained model is registered" in main.user_model_errors[123]
+
+
+def test_privacy_export_delete_and_retention_endpoints() -> None:
+    client = TestClient(app)
+    owner_headers = register_user(client, f"privacy-{uuid4().hex}@example.com")
+    other_headers = register_user(client, f"private-{uuid4().hex}@example.com")
+    session_id = client.post("/sessions/start", headers=owner_headers).json()["id"]
+
+    exported = client.get("/data/export.json", headers=owner_headers)
+    assert exported.status_code == 200
+    assert exported.headers["content-disposition"].endswith(
+        'filename="focus-guard-export.json"'
+    )
+    assert [session["id"] for session in exported.json()["sessions"]] == [session_id]
+    assert client.get("/data/export.json", headers=other_headers).json()["sessions"] == []
+
+    assert client.get("/privacy/retention", headers=owner_headers).json() == {
+        "retention_days": None
+    }
+    configured = client.put(
+        "/privacy/retention",
+        headers=owner_headers,
+        json={"retention_days": 30},
+    )
+    assert configured.status_code == 200
+    assert configured.json()["retention_days"] == 30
+    assert client.put(
+        "/privacy/retention",
+        headers=owner_headers,
+        json={"retention_days": 0},
+    ).status_code == 422
+
+    assert client.delete(
+        f"/sessions/{session_id}", headers=other_headers
+    ).status_code == 404
+    assert client.delete(
+        f"/sessions/{session_id}", headers=owner_headers
+    ).status_code == 200
+    assert client.get("/history", headers=owner_headers).json() == []
+
+    client.post("/sessions/start", headers=owner_headers)
+    deleted = client.delete("/data", headers=owner_headers)
+    assert deleted.status_code == 200
+    assert deleted.json() == {"ok": True, "deleted_sessions": 1}
+    assert client.get("/history", headers=owner_headers).json() == []
 
 
 def test_user_registration_and_login_endpoints() -> None:

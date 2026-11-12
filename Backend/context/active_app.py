@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import platform
 
-from Backend.context.macos import get_active_application as get_macos_application
-from Backend.context.windows import get_active_application as get_windows_application
+from backend.context.macos import get_active_application as get_macos_application
+from backend.context.windows import get_active_application as get_windows_application
 
 
 def get_active_application() -> str:

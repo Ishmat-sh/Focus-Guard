@@ -3,15 +3,19 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import secrets
 import sqlite3
 from pathlib import Path
 from time import time
 from typing import Any
 
+from backend.features.schema import FEATURE_SCHEMA_VERSION, validate_feature_vector
+
 
 class Database:
     _PASSWORD_ITERATIONS = 310_000
+    SCHEMA_VERSION = 2
 
     def __init__(self, path: str | Path = "focus_guard.db") -> None:
         requested_path = Path(path)
@@ -70,7 +74,95 @@ class Database:
             self.connection.execute(
                 "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0"
             )
+        self._migrate_phase2_schema()
         self.connection.commit()
+
+    def _migrate_phase2_schema(self) -> None:
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at REAL NOT NULL
+            )
+            """
+        )
+        applied = {
+            int(row["version"])
+            for row in self.connection.execute("SELECT version FROM schema_migrations")
+        }
+        if self.SCHEMA_VERSION in applied:
+            return
+
+        telemetry_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(telemetry)")
+        }
+        if "elapsed_seconds" not in telemetry_columns:
+            self.connection.execute(
+                "ALTER TABLE telemetry ADD COLUMN elapsed_seconds REAL"
+            )
+        if "features_json" not in telemetry_columns:
+            self.connection.execute(
+                "ALTER TABLE telemetry ADD COLUMN features_json TEXT"
+            )
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS collection_consents (
+                session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                consented_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS feature_windows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                start_elapsed_seconds REAL NOT NULL,
+                end_elapsed_seconds REAL NOT NULL,
+                schema_version INTEGER NOT NULL,
+                features_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                UNIQUE(session_id, start_elapsed_seconds),
+                CHECK(start_elapsed_seconds >= 0),
+                CHECK(end_elapsed_seconds > start_elapsed_seconds)
+            );
+            CREATE TABLE IF NOT EXISTS labels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                start_elapsed_seconds REAL NOT NULL,
+                end_elapsed_seconds REAL NOT NULL,
+                label TEXT NOT NULL CHECK(
+                    label IN ('focused', 'drifting', 'distracted', 'fatigued')
+                ),
+                source TEXT NOT NULL DEFAULT 'self_reported' CHECK(
+                    source IN ('self_reported', 'rule_based', 'imported')
+                ),
+                created_at REAL NOT NULL,
+                CHECK(start_elapsed_seconds >= 0),
+                CHECK(end_elapsed_seconds > start_elapsed_seconds)
+            );
+            CREATE TABLE IF NOT EXISTS model_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                trained_at REAL,
+                metrics_json TEXT,
+                file_path TEXT,
+                is_active INTEGER NOT NULL DEFAULT 0 CHECK(is_active IN (0, 1)),
+                UNIQUE(name, version)
+            );
+            CREATE TABLE IF NOT EXISTS user_privacy_settings (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                retention_days INTEGER CHECK(
+                    retention_days IS NULL OR retention_days BETWEEN 1 AND 3650
+                )
+            );
+            CREATE INDEX IF NOT EXISTS idx_telemetry_session_elapsed
+                ON telemetry(session_id, elapsed_seconds);
+            CREATE INDEX IF NOT EXISTS idx_labels_session_range
+                ON labels(session_id, start_elapsed_seconds, end_elapsed_seconds);
+            """
+        )
+        self.connection.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (self.SCHEMA_VERSION, time()),
+        )
 
     def save_session(self, session: Any, user_id: int | None = None) -> None:
         self.connection.execute(
@@ -88,12 +180,401 @@ class Database:
         )
         self.connection.commit()
 
-    def save_telemetry(self, session_id: int, recorded_at: float, result: Any, face_present: bool) -> None:
+    def save_telemetry(
+        self,
+        session_id: int,
+        recorded_at: float,
+        result: Any,
+        face_present: bool,
+        elapsed_seconds: float | None = None,
+        features: dict[str, Any] | None = None,
+    ) -> None:
+        if features is not None and not self.collection_is_consented(session_id):
+            raise ValueError("Feature collection requires session consent")
         self.connection.execute(
-            "INSERT INTO telemetry (session_id, recorded_at, score, state, app_name, app_category, face_present) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (session_id, recorded_at, result.score, result.state.value, result.app_name, result.app_category, int(face_present)),
+            """
+            INSERT INTO telemetry (
+                session_id, recorded_at, score, state, app_name, app_category,
+                face_present, elapsed_seconds, features_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                recorded_at,
+                result.score,
+                result.state.value,
+                result.app_name,
+                result.app_category,
+                int(face_present),
+                elapsed_seconds,
+                json.dumps(features, separators=(",", ":"), sort_keys=True)
+                if features is not None
+                else None,
+            ),
         )
         self.connection.commit()
+
+    def session_for_user(self, session_id: int, user_id: int) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM sessions WHERE id = ? AND user_id = ?",
+            (session_id, user_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_session(self, session_id: int, user_id: int) -> bool:
+        with self.connection:
+            exists = self.connection.execute(
+                "SELECT 1 FROM sessions WHERE id = ? AND user_id = ?",
+                (session_id, user_id),
+            ).fetchone()
+            if exists is None:
+                return False
+            self.connection.execute(
+                "DELETE FROM telemetry WHERE session_id = ?", (session_id,)
+            )
+            self.connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        return True
+
+    def delete_all_user_data(self, user_id: int) -> int:
+        with self.connection:
+            session_ids = [
+                row["id"]
+                for row in self.connection.execute(
+                    "SELECT id FROM sessions WHERE user_id = ?", (user_id,)
+                )
+            ]
+            if session_ids:
+                placeholders = ",".join("?" for _ in session_ids)
+                self.connection.execute(
+                    f"DELETE FROM telemetry WHERE session_id IN ({placeholders})",
+                    session_ids,
+                )
+                self.connection.execute(
+                    f"DELETE FROM sessions WHERE id IN ({placeholders})",
+                    session_ids,
+                )
+            self.connection.execute(
+                "DELETE FROM user_privacy_settings WHERE user_id = ?", (user_id,)
+            )
+        return len(session_ids)
+
+    def export_user_data(self, user_id: int) -> dict[str, Any]:
+        sessions = self.connection.execute(
+            "SELECT * FROM sessions WHERE user_id = ? ORDER BY id", (user_id,)
+        ).fetchall()
+        exported_sessions: list[dict[str, Any]] = []
+        for session in sessions:
+            telemetry_rows = self.connection.execute(
+                """
+                SELECT id, recorded_at, elapsed_seconds, score, state,
+                       app_name, app_category, face_present, features_json
+                FROM telemetry WHERE session_id = ? ORDER BY recorded_at, id
+                """,
+                (session["id"],),
+            ).fetchall()
+            telemetry = []
+            for row in telemetry_rows:
+                data = dict(row)
+                features_json = data.pop("features_json")
+                data["features"] = (
+                    json.loads(features_json)
+                    if features_json is not None
+                    else None
+                )
+                telemetry.append(data)
+            label_rows = self.connection.execute(
+                "SELECT * FROM labels WHERE session_id = ? ORDER BY start_elapsed_seconds, id",
+                (session["id"],),
+            ).fetchall()
+            window_rows = self.connection.execute(
+                "SELECT * FROM feature_windows WHERE session_id = ? ORDER BY start_elapsed_seconds, id",
+                (session["id"],),
+            ).fetchall()
+            windows = []
+            for row in window_rows:
+                data = dict(row)
+                data["features"] = json.loads(data.pop("features_json"))
+                windows.append(data)
+            consented = self.collection_is_consented(session["id"], user_id)
+            exported_sessions.append(
+                dict(session)
+                | {
+                    "collection_consented": consented,
+                    "telemetry": telemetry,
+                    "labels": [dict(row) for row in label_rows],
+                    "feature_windows": windows,
+                }
+            )
+        return {"exported_at": time(), "sessions": exported_sessions}
+
+    def set_retention_days(self, user_id: int, retention_days: int | None) -> None:
+        if retention_days is not None and not 1 <= retention_days <= 3650:
+            raise ValueError("retention_days must be between 1 and 3650, or null")
+        self.connection.execute(
+            """
+            INSERT INTO user_privacy_settings (user_id, retention_days)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                retention_days = excluded.retention_days
+            """,
+            (user_id, retention_days),
+        )
+        self.connection.commit()
+
+    def retention_days(self, user_id: int) -> int | None:
+        row = self.connection.execute(
+            "SELECT retention_days FROM user_privacy_settings WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return int(row["retention_days"]) if row and row["retention_days"] else None
+
+    def apply_retention_policy(self, user_id: int, now: float | None = None) -> int:
+        days = self.retention_days(user_id)
+        if days is None:
+            return 0
+        cutoff = (time() if now is None else now) - days * 86_400
+        with self.connection:
+            self.connection.execute(
+                """
+                DELETE FROM feature_windows
+                WHERE created_at < ?
+                  AND session_id IN (SELECT id FROM sessions WHERE user_id = ?)
+                """,
+                (cutoff, user_id),
+            )
+            self.connection.execute(
+                """
+                DELETE FROM labels
+                WHERE created_at < ?
+                  AND session_id IN (SELECT id FROM sessions WHERE user_id = ?)
+                """,
+                (cutoff, user_id),
+            )
+            cursor = self.connection.execute(
+                """
+                DELETE FROM telemetry
+                WHERE recorded_at < ?
+                  AND session_id IN (SELECT id FROM sessions WHERE user_id = ?)
+                """,
+                (cutoff, user_id),
+            )
+        return cursor.rowcount
+
+    def set_collection_consent(
+        self, session_id: int, user_id: int, consented: bool
+    ) -> bool:
+        if self.session_for_user(session_id, user_id) is None:
+            return False
+        if consented:
+            self.connection.execute(
+                """
+                INSERT INTO collection_consents (session_id, consented_at)
+                VALUES (?, ?)
+                ON CONFLICT(session_id) DO NOTHING
+                """,
+                (session_id, time()),
+            )
+        else:
+            self.connection.execute(
+                "DELETE FROM collection_consents WHERE session_id = ?", (session_id,)
+            )
+            self.connection.execute(
+                "DELETE FROM feature_windows WHERE session_id = ?", (session_id,)
+            )
+            self.connection.execute("DELETE FROM labels WHERE session_id = ?", (session_id,))
+            self.connection.execute(
+                "UPDATE telemetry SET features_json = NULL WHERE session_id = ?",
+                (session_id,),
+            )
+        self.connection.commit()
+        return True
+
+    def collection_is_consented(self, session_id: int, user_id: int | None = None) -> bool:
+        query = """
+            SELECT 1 FROM collection_consents
+            JOIN sessions ON sessions.id = collection_consents.session_id
+            WHERE collection_consents.session_id = ?
+        """
+        parameters: tuple[int, ...] = (session_id,)
+        if user_id is not None:
+            query += " AND sessions.user_id = ?"
+            parameters += (user_id,)
+        return self.connection.execute(query, parameters).fetchone() is not None
+
+    def create_label(
+        self,
+        session_id: int,
+        user_id: int,
+        start_elapsed_seconds: float,
+        end_elapsed_seconds: float,
+        label: str,
+    ) -> dict[str, Any]:
+        if not self.collection_is_consented(session_id, user_id):
+            raise ValueError("Data collection consent is required for this session")
+        cursor = self.connection.execute(
+            """
+            INSERT INTO labels (
+                session_id, start_elapsed_seconds, end_elapsed_seconds,
+                label, source, created_at
+            ) VALUES (?, ?, ?, ?, 'self_reported', ?)
+            """,
+            (session_id, start_elapsed_seconds, end_elapsed_seconds, label, time()),
+        )
+        self.connection.commit()
+        row = self.connection.execute(
+            "SELECT * FROM labels WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+        return dict(row)
+
+    def labels_for_session(self, session_id: int, user_id: int) -> list[dict[str, Any]]:
+        if not self.collection_is_consented(session_id, user_id):
+            raise ValueError("Data collection consent is required for this session")
+        rows = self.connection.execute(
+            "SELECT * FROM labels WHERE session_id = ? ORDER BY start_elapsed_seconds, id",
+            (session_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_feature_window(
+        self,
+        session_id: int,
+        start_elapsed_seconds: float,
+        end_elapsed_seconds: float,
+        features: dict[str, object],
+    ) -> None:
+        validated = validate_feature_vector(features)
+        if not self.collection_is_consented(session_id):
+            raise ValueError("Feature collection requires session consent")
+        self.connection.execute(
+            """
+            INSERT INTO feature_windows (
+                session_id, start_elapsed_seconds, end_elapsed_seconds,
+                schema_version, features_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id, start_elapsed_seconds) DO UPDATE SET
+                end_elapsed_seconds = excluded.end_elapsed_seconds,
+                schema_version = excluded.schema_version,
+                features_json = excluded.features_json,
+                created_at = excluded.created_at
+            """,
+            (
+                session_id,
+                start_elapsed_seconds,
+                end_elapsed_seconds,
+                FEATURE_SCHEMA_VERSION,
+                json.dumps(validated, separators=(",", ":"), sort_keys=True),
+                time(),
+            ),
+        )
+        self.connection.commit()
+
+    def feature_samples(self, session_id: int, user_id: int) -> list[dict[str, Any]]:
+        if not self.collection_is_consented(session_id, user_id):
+            raise ValueError("Data collection consent is required for this session")
+        rows = self.connection.execute(
+            """
+            SELECT elapsed_seconds, features_json
+            FROM telemetry
+            WHERE session_id = ? AND features_json IS NOT NULL
+              AND elapsed_seconds IS NOT NULL
+            ORDER BY elapsed_seconds, id
+            """,
+            (session_id,),
+        ).fetchall()
+        return [
+            {"elapsed_seconds": row["elapsed_seconds"], **json.loads(row["features_json"])}
+            for row in rows
+        ]
+
+    def feature_windows_for_session(
+        self, session_id: int, user_id: int
+    ) -> list[dict[str, Any]]:
+        if not self.collection_is_consented(session_id, user_id):
+            raise ValueError("Data collection consent is required for this session")
+        rows = self.connection.execute(
+            """
+            SELECT * FROM feature_windows
+            WHERE session_id = ?
+            ORDER BY start_elapsed_seconds, id
+            """,
+            (session_id,),
+        ).fetchall()
+        return [
+            dict(row) | {"features": json.loads(row["features_json"])}
+            for row in rows
+        ]
+
+    def register_model_version(
+        self,
+        name: str,
+        version: str,
+        metrics: dict[str, Any],
+        file_path: str,
+        trained_at: float,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE model_versions SET is_active = 0 WHERE name = ?", (name,)
+            )
+            self.connection.execute(
+                """
+                INSERT INTO model_versions (
+                    name, version, trained_at, metrics_json, file_path, is_active
+                ) VALUES (?, ?, ?, ?, ?, 1)
+                ON CONFLICT(name, version) DO UPDATE SET
+                    trained_at = excluded.trained_at,
+                    metrics_json = excluded.metrics_json,
+                    file_path = excluded.file_path,
+                    is_active = 1
+                """,
+                (
+                    name,
+                    version,
+                    trained_at,
+                    json.dumps(
+                        metrics,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                        allow_nan=False,
+                    ),
+                    file_path,
+                ),
+            )
+
+    def active_model_version(self, name: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM model_versions WHERE name = ? AND is_active = 1",
+            (name,),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row) | {"metrics": json.loads(row["metrics_json"])}
+
+    def labeled_feature_windows(
+        self, session_id: int, user_id: int
+    ) -> list[dict[str, Any]]:
+        windows = self.feature_windows_for_session(session_id, user_id)
+        labels = self.labels_for_session(session_id, user_id)
+        dataset: list[dict[str, Any]] = []
+        for window in windows:
+            overlaps = [
+                label
+                for label in labels
+                if min(window["end_elapsed_seconds"], label["end_elapsed_seconds"])
+                > max(window["start_elapsed_seconds"], label["start_elapsed_seconds"])
+            ]
+            if not overlaps:
+                continue
+            selected = max(
+                overlaps,
+                key=lambda label: (
+                    min(window["end_elapsed_seconds"], label["end_elapsed_seconds"])
+                    - max(window["start_elapsed_seconds"], label["start_elapsed_seconds"]),
+                    -label["id"],
+                ),
+            )
+            dataset.append(window | {"label": selected["label"]})
+        return dataset
 
     def create_user(self, name: str, email: str, password: str) -> dict[str, Any]:
         normalized_email = email.strip().lower()
