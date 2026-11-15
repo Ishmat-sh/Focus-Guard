@@ -1,6 +1,8 @@
 from dataclasses import asdict
 import csv
 from io import StringIO
+import hmac
+import ipaddress
 import logging
 import os
 from pathlib import Path
@@ -9,8 +11,9 @@ from threading import RLock
 from time import monotonic, time
 from typing import Any, Literal
 from collections import deque
+from datetime import date, datetime, timedelta, timezone
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Response
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBasic, HTTPBasicCredentials, HTTPBearer
@@ -19,9 +22,15 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 from backend.context.active_app import get_active_application
-from backend.context.categories import categorize_application
+from backend.context.categories import categorize_application, sanitize_application_name
 from backend.core.alerts import AlertManager
 from backend.core.fatigue import FatigueEstimator, FatigueSnapshot
+from backend.analytics.service import (
+    build_heatmap,
+    build_streaks,
+    build_weekly_analytics,
+    refresh_user_analytics,
+)
 from backend.core.scoring import AttentionResult, AttentionScorer, AttentionState, VisionSignals
 from backend.core.session import SessionManager
 from backend.ml.inference import ModelInference
@@ -63,6 +72,16 @@ class AttentionLabelRequest(BaseModel):
 
 class RetentionRequest(BaseModel):
     retention_days: int | None = Field(default=None, ge=1, le=3650)
+
+
+class BrowserContextRequest(BaseModel):
+    domain: str = Field(min_length=1, max_length=253)
+
+
+class CategoryRuleRequest(BaseModel):
+    rule_type: Literal["app", "domain"]
+    rule_value: str = Field(min_length=1, max_length=253)
+    category: Literal["productive", "neutral", "distracting"]
 
 
 admin_security = HTTPBasic()
@@ -168,7 +187,12 @@ def pause_session(user: dict[str, object] = Depends(require_ready_user)) -> dict
 @app.post("/sessions/resume")
 def resume_session(user: dict[str, object] = Depends(require_ready_user)) -> dict[str, object]:
     user_id = int(user["id"])
-    return _session_action(_session_manager_for(user_id).resume, user_id)
+    result = _session_action(_session_manager_for(user_id).resume, user_id)
+    estimator = user_fatigue_estimators.get(user_id)
+    if estimator is not None:
+        estimator.reset()
+    user_fatigue_snapshots.pop(user_id, None)
+    return result
 
 
 @app.post("/sessions/end")
@@ -177,7 +201,10 @@ def end_session(user: dict[str, object] = Depends(require_ready_user)) -> dict[s
     result = _session_action(_session_manager_for(user_id).end, user_id)
     if database.collection_is_consented(int(result["id"]), user_id):
         _persist_feature_windows(int(result["id"]), user_id)
-    database.apply_retention_policy(user_id)
+    refresh_user_analytics(database, user_id)
+    _generate_session_insights(user_id, int(result["id"]))
+    if database.apply_retention_policy(user_id):
+        refresh_user_analytics(database, user_id)
     last_active_applications.pop(user_id, None)
     user_model_inferences.pop(user_id, None)
     user_model_errors.pop(user_id, None)
@@ -221,8 +248,10 @@ def analyze_attention_frame(
         upright=None if snapshot.posture == "unknown" else snapshot.posture == "upright",
         blink_rate=snapshot.blink_rate,
     )
-    app_name = get_active_application()
-    app_category = categorize_application(app_name).value
+    app_name = sanitize_application_name(get_active_application())
+    app_category = database.category_for_application(user_id, app_name)
+    if app_category == "unknown":
+        app_category = categorize_application(app_name).value
     result = user_scorer.score(signals, app_category, app_name)
     confidence: float | None = None
     inference_ms: float | None = None
@@ -232,9 +261,27 @@ def analyze_attention_frame(
     with runtime_lock:
         session = _session_manager_for(user_id).snapshot()
         if session:
+            browser_context = None
+            if session.state.value == "running" and _is_browser_application(app_name):
+                browser_context = database.latest_browser_context(
+                    user_id,
+                    session.id,
+                    time(),
+                )
+                if browser_context is not None:
+                    app_category = (
+                        database.category_for_domain(user_id, browser_context["domain"])
+                        or (
+                            browser_context["category"]
+                            if browser_context["category"] != "unknown"
+                            else categorize_application(browser_context["domain"]).value
+                        )
+                    )
+                    result = user_scorer.score(signals, app_category, app_name)
             if session.state.value == "running":
                 fatigue = _fatigue_estimator_for(user_id).update(
                     snapshot.ear,
+                    mouth_aspect_ratio=snapshot.mouth_aspect_ratio,
                     now=monotonic(),
                 )
                 user_fatigue_snapshots[user_id] = fatigue
@@ -244,8 +291,15 @@ def analyze_attention_frame(
                 user_fatigue_estimators.pop(user_id, None)
                 user_fatigue_snapshots.pop(user_id, None)
             previous_app = last_active_applications.get(user_id)
-            app_switch_count = int(previous_app is not None and previous_app != app_name)
-            last_active_applications[user_id] = app_name
+            application_context = (
+                f"{app_name}:{browser_context['domain']}"
+                if browser_context is not None
+                else app_name
+            )
+            app_switch_count = int(
+                previous_app is not None and previous_app != application_context
+            )
+            last_active_applications[user_id] = application_context
             frame_sample = {
                 "active_app_category": result.app_category,
                 "app_switch_count": app_switch_count,
@@ -324,6 +378,7 @@ def analyze_attention_frame(
         "perclos": fatigue.perclos,
         "average_blink_duration_seconds": fatigue.average_blink_duration_seconds,
         "slow_blink_count": fatigue.slow_blink_count,
+        "yawn_count": fatigue.yawn_count,
         "break_suggestion": fatigue.break_suggestion,
         "fatigue_is_estimate": True,
     }
@@ -445,6 +500,7 @@ def delete_session(
     if not database.delete_session(session_id, user_id):
         raise HTTPException(404, "Session not found")
     _discard_session_runtime(user_id, session_id)
+    refresh_user_analytics(database, user_id)
     return {"ok": True}
 
 
@@ -467,6 +523,7 @@ def delete_all_user_data(
     user_id = int(user["id"])
     deleted_sessions = database.delete_all_user_data(user_id)
     _discard_session_runtime(user_id)
+    refresh_user_analytics(database, user_id)
     return {"ok": True, "deleted_sessions": deleted_sessions}
 
 
@@ -485,10 +542,162 @@ def set_retention_policy(
     user_id = int(user["id"])
     database.set_retention_days(user_id, payload.retention_days)
     deleted_telemetry = database.apply_retention_policy(user_id)
+    if deleted_telemetry:
+        refresh_user_analytics(database, user_id)
     return {
         "retention_days": payload.retention_days,
         "deleted_telemetry_rows": deleted_telemetry,
     }
+
+
+@app.post("/sessions/{session_id}/context/browser")
+def receive_browser_context(
+    session_id: int,
+    payload: BrowserContextRequest,
+    request: Request,
+    local_token: str | None = Header(default=None, alias="X-Focus-Guard-Token"),
+) -> dict[str, object]:
+    configured_token = os.getenv("FOCUS_GUARD_BROWSER_TOKEN")
+    if not configured_token:
+        raise HTTPException(503, "Browser context bridge is not configured")
+    if local_token is None or not hmac.compare_digest(local_token, configured_token):
+        raise HTTPException(401, "Valid local browser token required")
+    client_host = request.client.host if request.client else ""
+    try:
+        if not ipaddress.ip_address(client_host).is_loopback:
+            raise HTTPException(403, "Browser context is accepted only from this device")
+    except ValueError as error:
+        raise HTTPException(403, "Browser context is accepted only from this device") from error
+    try:
+        domain = _normalize_domain(payload.domain)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    user_id = database.session_owner(session_id)
+    if user_id is None:
+        raise HTTPException(404, "Session not found")
+    with runtime_lock:
+        manager = _session_manager_for(user_id)
+        session = manager.snapshot()
+        if session is None or session.id != session_id or session.state.value != "running":
+            raise HTTPException(409, "Browser context requires the user's running session")
+        context = database.save_browser_context(
+            session_id,
+            domain,
+            time(),
+            session.elapsed_seconds,
+        )
+    if context is None:
+        raise HTTPException(409, "Browser context requires a running owned session")
+    return context
+
+
+@app.get("/context/browser")
+def current_browser_context(
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, object] | None:
+    user_id = int(user["id"])
+    session = _session_manager_for(user_id).snapshot()
+    if session is None or session.state.value != "running":
+        return None
+    return database.latest_browser_context(user_id, session.id, time())
+
+
+@app.get("/context/category-rules")
+def list_category_rules(
+    user: dict[str, object] = Depends(require_ready_user),
+) -> list[dict[str, object]]:
+    return database.category_rules(int(user["id"]))
+
+
+@app.put("/context/category-rules")
+def set_category_rule(
+    payload: CategoryRuleRequest,
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, object]:
+    try:
+        if payload.rule_type == "domain":
+            rule_value = _normalize_domain(payload.rule_value)
+        else:
+            rule_value = payload.rule_value.strip()
+            if not rule_value or any(char in rule_value for char in "\r\n"):
+                raise ValueError("Application rule must be a non-empty name")
+        return database.upsert_category_rule(
+            int(user["id"]),
+            payload.rule_type,
+            rule_value,
+            payload.category,
+        )
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.delete("/context/category-rules/{rule_id}")
+def delete_category_rule(
+    rule_id: int,
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, bool]:
+    if not database.delete_category_rule(int(user["id"]), rule_id):
+        raise HTTPException(404, "Category rule not found")
+    return {"ok": True}
+
+
+@app.get("/analytics/weekly")
+def weekly_analytics(
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, object]:
+    start, end = _analytics_date_range(start_date, end_date)
+    return build_weekly_analytics(database, int(user["id"]), start, end)
+
+
+@app.get("/analytics/heatmap")
+def analytics_heatmap(
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, object]:
+    start, end = _analytics_date_range(start_date, end_date)
+    return build_heatmap(database, int(user["id"]), start, end)
+
+
+@app.get("/analytics/streaks")
+def analytics_streaks(
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    minimum_minutes: float = Query(default=5.0, gt=0, le=1440),
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, object]:
+    start, end = _analytics_date_range(start_date, end_date)
+    return build_streaks(
+        database,
+        int(user["id"]),
+        start,
+        end,
+        minimum_seconds=minimum_minutes * 60.0,
+    )
+
+
+@app.get("/insights")
+def list_insights(
+    session_id: int | None = Query(default=None, ge=1),
+    user: dict[str, object] = Depends(require_ready_user),
+) -> list[dict[str, object]]:
+    if session_id is not None and database.session_for_user(
+        session_id, int(user["id"])
+    ) is None:
+        raise HTTPException(404, "Session not found")
+    return database.insights_for_user(int(user["id"]), session_id)
+
+
+@app.post("/insights/{insight_id}/dismiss")
+def dismiss_insight(
+    insight_id: int,
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, bool]:
+    if not database.dismiss_insight(int(user["id"]), insight_id):
+        raise HTTPException(404, "Insight not found")
+    return {"ok": True}
 
 
 @app.get("/metrics")
@@ -669,7 +878,7 @@ def _fatigue_estimator_for(user_id: int) -> FatigueEstimator:
 
 
 def _empty_fatigue_snapshot() -> FatigueSnapshot:
-    return FatigueSnapshot(0.0, "low", None, None, 0, False)
+    return FatigueSnapshot(0.0, "low", None, None, 0, 0, False)
 
 
 def _score_with_model(
@@ -789,6 +998,149 @@ def _persist_feature_windows(session_id: int, user_id: int) -> None:
             start_elapsed_seconds=start,
         )
         database.save_feature_window(session_id, start, end, features)
+
+
+def _normalize_domain(domain: str) -> str:
+    if domain != domain.strip() or any(
+        character in domain for character in "/\\:@?#"
+    ):
+        raise ValueError("Provide a hostname only, without URL, path, or port")
+    try:
+        normalized = domain.rstrip(".").encode("idna").decode("ascii").casefold()
+    except UnicodeError as error:
+        raise ValueError("Domain name is invalid") from error
+    if not normalized or len(normalized) > 253:
+        raise ValueError("Domain name is invalid")
+    labels = normalized.split(".")
+    if any(
+        not label
+        or len(label) > 63
+        or label.startswith("-")
+        or label.endswith("-")
+        or any(not (character.isascii() and (character.isalnum() or character == "-"))
+               for character in label)
+        for label in labels
+    ):
+        raise ValueError("Domain name is invalid")
+    return normalized
+
+
+def _is_browser_application(app_name: str) -> bool:
+    return app_name.casefold() in {
+        "chrome",
+        "google chrome",
+        "chromium",
+        "edge",
+        "microsoft edge",
+        "firefox",
+        "safari",
+        "brave",
+        "opera",
+        "vivaldi",
+    }
+
+
+def _analytics_date_range(
+    start_date: date | None, end_date: date | None
+) -> tuple[date, date]:
+    today = datetime.now(timezone.utc).date()
+    if start_date is None and end_date is None:
+        end = today
+        start = end - timedelta(days=6)
+    elif start_date is None:
+        end = end_date
+        start = end - timedelta(days=6)
+    elif end_date is None:
+        start = start_date
+        end = start + timedelta(days=6)
+    else:
+        start = start_date
+        end = end_date
+    if start > end:
+        raise HTTPException(422, "start_date must be on or before end_date")
+    if (end - start).days > 365:
+        raise HTTPException(422, "Date range cannot exceed 366 days")
+    return start, end
+
+
+def _generate_session_insights(user_id: int, session_id: int) -> None:
+    rows = database.connection.execute(
+        """
+        SELECT recorded_at, elapsed_seconds, score, state, app_name, app_category
+        FROM telemetry WHERE session_id = ?
+        ORDER BY recorded_at, id
+        """,
+        (session_id,),
+    ).fetchall()
+    if not rows:
+        return
+    weighted_score = 0.0
+    observed_seconds = 0.0
+    distraction_count = 0
+    previous_state: str | None = None
+    distracting_apps: dict[str, float] = {}
+    for current, following in zip(rows, rows[1:]):
+        if current["state"] == "distracted" and previous_state != "distracted":
+            distraction_count += 1
+        previous_state = current["state"]
+        wall_gap = float(following["recorded_at"]) - float(current["recorded_at"])
+        elapsed_gap = (
+            float(following["elapsed_seconds"]) - float(current["elapsed_seconds"])
+            if following["elapsed_seconds"] is not None
+            and current["elapsed_seconds"] is not None
+            else wall_gap
+        )
+        duration = min(max(wall_gap, 0.0), max(elapsed_gap, 0.0), 30.0)
+        if duration == 0:
+            continue
+        weighted_score += float(current["score"]) * duration
+        observed_seconds += duration
+        if current["app_category"] == "distracting":
+            app_name = str(current["app_name"] or "Unknown")
+            distracting_apps[app_name] = distracting_apps.get(app_name, 0.0) + duration
+    if rows[-1]["state"] == "distracted" and previous_state != "distracted":
+        distraction_count += 1
+    if observed_seconds == 0:
+        return
+
+    average_score = weighted_score / observed_seconds
+    generated_at = time()
+    insights: list[tuple[str, str]] = []
+    if average_score < 60:
+        insights.append(
+            (
+                "low_focus",
+                f"Your average focus score was {average_score:.0f} this session. "
+                "Consider a short planned break before your next focus block.",
+            )
+        )
+    if distraction_count >= 3:
+        insights.append(
+            (
+                "repeated_distraction",
+                f"Your attention shifted into a distracted state {distraction_count} "
+                "times. Try reducing interruptions for your next focus block.",
+            )
+        )
+    if distracting_apps:
+        top_app, duration = max(distracting_apps.items(), key=lambda item: item[1])
+        if duration >= 60:
+            insights.append(
+                (
+                    "distracting_app",
+                    f"{top_app} was active during about {duration / 60:.0f} minutes "
+                    "of this session. Consider setting a boundary for your next block.",
+                )
+            )
+    for insight_type, message in insights:
+        database.create_insight(
+            user_id,
+            session_id,
+            insight_type,
+            message,
+            generated_at,
+            source="rules",
+        )
 
 
 def _discard_session_runtime(user_id: int, session_id: int | None = None) -> None:

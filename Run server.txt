@@ -2,10 +2,19 @@ MAC
 
 Terminal 1 - Backend
 cd /path/to/Focus-Guard
+export FOCUS_GUARD_DB_PATH="$PWD/focus_guard.db"
+.venv/bin/python -m alembic upgrade head
 .venv/bin/python -m uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 
 The default database is the project-root focus_guard.db. To select another database,
 set FOCUS_GUARD_DB_PATH to its absolute path before starting the backend.
+Before sharing extension access with a trusted local browser, set
+FOCUS_GUARD_BROWSER_TOKEN to a private random token. The browser bridge accepts
+domain-only requests from loopback clients; it does not accept or store URLs or titles.
+To create a migration after a schema change, run:
+.venv/bin/python -m alembic revision --autogenerate -m "describe the schema change"
+Review the generated migration, then apply it with:
+.venv/bin/python -m alembic upgrade head
 
 Terminal 2 - Frontend
 cd /path/to/Focus-Guard/frontend
@@ -24,6 +33,8 @@ WINDOWS
 
 Terminal 1 - Backend
 cd C:\path\to\Focus-Guard
+$env:FOCUS_GUARD_DB_PATH = "$PWD\focus_guard.db"
+.venv\Scripts\python -m alembic upgrade head
 .venv\Scripts\python -m uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 
 Terminal 2 - Frontend

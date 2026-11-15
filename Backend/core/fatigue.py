@@ -13,6 +13,7 @@ class FatigueSnapshot:
     perclos: float | None
     average_blink_duration_seconds: float | None
     slow_blink_count: int
+    yawn_count: int
     break_suggestion: bool
 
 
@@ -24,6 +25,8 @@ class FatigueEstimator:
         break_threshold: float = 70.0,
         sustained_seconds: float = 120.0,
         ear_threshold: float = 0.21,
+        yawn_threshold: float = 0.6,
+        yawn_duration_seconds: float = 1.0,
     ) -> None:
         if (
             not isfinite(window_seconds)
@@ -31,11 +34,15 @@ class FatigueEstimator:
             or not isfinite(slow_blink_seconds)
             or not isfinite(break_threshold)
             or not isfinite(ear_threshold)
+            or not isfinite(yawn_threshold)
+            or not isfinite(yawn_duration_seconds)
             or window_seconds <= 0
             or sustained_seconds <= 0
             or slow_blink_seconds <= 0
             or not 0 <= break_threshold <= 100
             or ear_threshold < 0
+            or yawn_threshold <= 0
+            or yawn_duration_seconds <= 0
         ):
             raise ValueError("Fatigue estimator durations must be greater than zero")
         self.window_seconds = window_seconds
@@ -43,15 +50,21 @@ class FatigueEstimator:
         self.break_threshold = break_threshold
         self.sustained_seconds = sustained_seconds
         self.ear_threshold = ear_threshold
+        self.yawn_threshold = yawn_threshold
+        self.yawn_duration_seconds = yawn_duration_seconds
         self._samples: deque[tuple[float, bool | None]] = deque()
         self._blink_durations: deque[tuple[float, float]] = deque()
+        self._yawn_times: deque[float] = deque()
         self._eyes_closed_since: float | None = None
+        self._mouth_open_since: float | None = None
+        self._yawn_recorded_for_open = False
         self._last_sample_at: float | None = None
         self._high_risk_since: float | None = None
 
     def update(
         self,
         ear: float | None,
+        mouth_aspect_ratio: float | None = None,
         now: float | None = None,
         active: bool = True,
     ) -> FatigueSnapshot:
@@ -63,6 +76,12 @@ class FatigueEstimator:
             return self._snapshot(timestamp)
         if ear is not None and (not isfinite(ear) or ear < 0):
             raise ValueError("ear must be a non-negative finite value or null")
+        if mouth_aspect_ratio is not None and (
+            not isfinite(mouth_aspect_ratio) or mouth_aspect_ratio < 0
+        ):
+            raise ValueError(
+                "mouth_aspect_ratio must be a non-negative finite value or null"
+            )
         if self._last_sample_at is not None and timestamp < self._last_sample_at:
             raise ValueError("sample timestamps must be non-decreasing")
 
@@ -77,6 +96,20 @@ class FatigueEstimator:
         elif eyes_closed is None:
             self._eyes_closed_since = None
 
+        if mouth_aspect_ratio is not None and mouth_aspect_ratio >= self.yawn_threshold:
+            if self._mouth_open_since is None:
+                self._mouth_open_since = timestamp
+                self._yawn_recorded_for_open = False
+            elif (
+                not self._yawn_recorded_for_open
+                and timestamp - self._mouth_open_since >= self.yawn_duration_seconds
+            ):
+                self._yawn_times.append(timestamp)
+                self._yawn_recorded_for_open = True
+        else:
+            self._mouth_open_since = None
+            self._yawn_recorded_for_open = False
+
         self._samples.append((timestamp, eyes_closed))
         self._last_sample_at = timestamp
         self._prune(timestamp)
@@ -85,7 +118,10 @@ class FatigueEstimator:
     def reset(self) -> None:
         self._samples.clear()
         self._blink_durations.clear()
+        self._yawn_times.clear()
         self._eyes_closed_since = None
+        self._mouth_open_since = None
+        self._yawn_recorded_for_open = False
         self._last_sample_at = None
         self._high_risk_since = None
 
@@ -121,10 +157,12 @@ class FatigueEstimator:
         slow_blinks = sum(
             duration >= self.slow_blink_seconds for duration in blink_durations
         )
+        yawn_count = len(self._yawn_times)
         risk = min(
             100.0,
             (perclos or 0.0) * 150.0
             + min(40.0, slow_blinks / max(self.window_seconds / 60.0, 1.0) * 20.0)
+            + min(20.0, yawn_count / max(self.window_seconds / 60.0, 1.0) * 10.0)
             + self._perclos_trend(perclos_samples),
         )
         if risk >= self.break_threshold:
@@ -143,6 +181,7 @@ class FatigueEstimator:
             perclos=perclos,
             average_blink_duration_seconds=average_blink,
             slow_blink_count=slow_blinks,
+            yawn_count=yawn_count,
             break_suggestion=break_suggestion,
         )
 
@@ -163,3 +202,5 @@ class FatigueEstimator:
             self._samples.popleft()
         while self._blink_durations and self._blink_durations[0][0] < cutoff:
             self._blink_durations.popleft()
+        while self._yawn_times and self._yawn_times[0] < cutoff:
+            self._yawn_times.popleft()

@@ -10,12 +10,13 @@ from pathlib import Path
 from time import time
 from typing import Any
 
+from backend.context.categories import categorize_application
 from backend.features.schema import FEATURE_SCHEMA_VERSION, validate_feature_vector
 
 
 class Database:
     _PASSWORD_ITERATIONS = 310_000
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, path: str | Path = "focus_guard.db") -> None:
         requested_path = Path(path)
@@ -153,6 +154,86 @@ class Database:
                     retention_days IS NULL OR retention_days BETWEEN 1 AND 3650
                 )
             );
+            CREATE TABLE IF NOT EXISTS daily_summaries (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                summary_date TEXT NOT NULL,
+                total_focus_seconds REAL NOT NULL,
+                observed_seconds REAL NOT NULL,
+                average_score REAL,
+                distraction_count INTEGER NOT NULL,
+                session_count INTEGER NOT NULL,
+                PRIMARY KEY (user_id, summary_date)
+            );
+            CREATE TABLE IF NOT EXISTS hourly_activity (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                activity_date TEXT NOT NULL,
+                hour_utc INTEGER NOT NULL CHECK(hour_utc BETWEEN 0 AND 23),
+                average_score REAL,
+                focus_seconds REAL NOT NULL,
+                sample_count INTEGER NOT NULL,
+                PRIMARY KEY (user_id, activity_date, hour_utc)
+            );
+            CREATE TABLE IF NOT EXISTS focus_streaks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                started_at REAL NOT NULL,
+                ended_at REAL NOT NULL,
+                duration_seconds REAL NOT NULL,
+                UNIQUE(session_id, started_at)
+            );
+            CREATE TABLE IF NOT EXISTS app_usage (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                usage_date TEXT NOT NULL,
+                app_name TEXT NOT NULL,
+                app_category TEXT NOT NULL,
+                duration_seconds REAL NOT NULL,
+                PRIMARY KEY (user_id, usage_date, app_name, app_category)
+            );
+            CREATE TABLE IF NOT EXISTS app_category_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                rule_type TEXT NOT NULL CHECK(rule_type IN ('app', 'domain')),
+                rule_value TEXT NOT NULL,
+                category TEXT NOT NULL CHECK(
+                    category IN ('productive', 'neutral', 'distracting')
+                ),
+                UNIQUE(user_id, rule_type, rule_value)
+            );
+            CREATE TABLE IF NOT EXISTS browser_context (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                recorded_at REAL NOT NULL,
+                elapsed_seconds REAL NOT NULL,
+                domain TEXT NOT NULL,
+                category TEXT NOT NULL CHECK(
+                    category IN ('productive', 'neutral', 'distracting', 'unknown')
+                )
+            );
+            CREATE TABLE IF NOT EXISTS insights (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                insight_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                generated_at REAL NOT NULL,
+                dismissed INTEGER NOT NULL DEFAULT 0 CHECK(dismissed IN (0, 1)),
+                source TEXT NOT NULL DEFAULT 'rules' CHECK(source IN ('rules', 'ai')),
+                UNIQUE(session_id, insight_type)
+            );
+            CREATE TABLE IF NOT EXISTS biometrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                recorded_at REAL NOT NULL,
+                heart_rate REAL NOT NULL CHECK(heart_rate > 0),
+                hrv REAL CHECK(hrv IS NULL OR hrv >= 0),
+                source_device TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_browser_context_session_time
+                ON browser_context(session_id, recorded_at);
+            CREATE INDEX IF NOT EXISTS idx_insights_user_session
+                ON insights(user_id, session_id, dismissed);
             CREATE INDEX IF NOT EXISTS idx_telemetry_session_elapsed
                 ON telemetry(session_id, elapsed_seconds);
             CREATE INDEX IF NOT EXISTS idx_labels_session_range
@@ -221,6 +302,347 @@ class Database:
         ).fetchone()
         return dict(row) if row else None
 
+    def session_owner(self, session_id: int) -> int | None:
+        row = self.connection.execute(
+            "SELECT user_id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return int(row["user_id"]) if row and row["user_id"] is not None else None
+
+    def telemetry_for_user(self, user_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT telemetry.session_id, telemetry.recorded_at,
+                   telemetry.elapsed_seconds, telemetry.score, telemetry.state,
+                   telemetry.app_name, telemetry.app_category
+            FROM telemetry
+            JOIN sessions ON sessions.id = telemetry.session_id
+            WHERE sessions.user_id = ?
+            ORDER BY telemetry.session_id, telemetry.recorded_at, telemetry.id
+            """,
+            (user_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_category_rule(
+        self, user_id: int, rule_type: str, rule_value: str, category: str
+    ) -> dict[str, Any]:
+        if rule_type not in {"app", "domain"}:
+            raise ValueError("rule_type must be 'app' or 'domain'")
+        if category not in {"productive", "neutral", "distracting"}:
+            raise ValueError("Unsupported application category")
+        self.connection.execute(
+            """
+            INSERT INTO app_category_rules (user_id, rule_type, rule_value, category)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, rule_type, rule_value) DO UPDATE SET
+                category = excluded.category
+            """,
+            (user_id, rule_type, rule_value, category),
+        )
+        self.connection.commit()
+        row = self.connection.execute(
+            """
+            SELECT id, rule_type, rule_value, category
+            FROM app_category_rules
+            WHERE user_id = ? AND rule_type = ? AND rule_value = ?
+            """,
+            (user_id, rule_type, rule_value),
+        ).fetchone()
+        return dict(row)
+
+    def category_rules(self, user_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT id, rule_type, rule_value, category
+            FROM app_category_rules WHERE user_id = ?
+            ORDER BY rule_type, rule_value
+            """,
+            (user_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_category_rule(self, user_id: int, rule_id: int) -> bool:
+        cursor = self.connection.execute(
+            "DELETE FROM app_category_rules WHERE user_id = ? AND id = ?",
+            (user_id, rule_id),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
+    def category_for_application(self, user_id: int, app_name: str) -> str:
+        row = self.connection.execute(
+            """
+            SELECT category FROM app_category_rules
+            WHERE user_id = ? AND rule_type = 'app' AND rule_value = ? COLLATE NOCASE
+            """,
+            (user_id, app_name.strip()),
+        ).fetchone()
+        return str(row["category"]) if row else "unknown"
+
+    def category_for_domain(self, user_id: int, domain: str) -> str | None:
+        rows = self.connection.execute(
+            """
+            SELECT rule_value, category FROM app_category_rules
+            WHERE user_id = ? AND rule_type = 'domain'
+            ORDER BY length(rule_value) DESC
+            """,
+            (user_id,),
+        ).fetchall()
+        normalized_domain = domain.casefold().rstrip(".")
+        for row in rows:
+            rule_domain = str(row["rule_value"]).casefold().rstrip(".")
+            if normalized_domain == rule_domain or normalized_domain.endswith(
+                "." + rule_domain
+            ):
+                return str(row["category"])
+        return None
+
+    def save_browser_context(
+        self,
+        session_id: int,
+        domain: str,
+        recorded_at: float,
+        elapsed_seconds: float,
+    ) -> dict[str, Any] | None:
+        session = self.connection.execute(
+            "SELECT id, user_id, state FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if session is None or session["user_id"] is None or session["state"] != "running":
+            return None
+        user_id = int(session["user_id"])
+        category = self.category_for_domain(user_id, domain)
+        if category is None:
+            category = categorize_application(domain).value
+        cursor = self.connection.execute(
+            """
+            INSERT INTO browser_context (
+                user_id, session_id, recorded_at, elapsed_seconds, domain, category
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, session_id, recorded_at, elapsed_seconds, domain, category),
+        )
+        self.connection.commit()
+        return {
+            "id": cursor.lastrowid,
+            "session_id": session_id,
+            "recorded_at": recorded_at,
+            "elapsed_seconds": elapsed_seconds,
+            "domain": domain,
+            "category": category,
+        }
+
+    def latest_browser_context(
+        self, user_id: int, session_id: int, now: float, max_age_seconds: float = 30.0
+    ) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT recorded_at, elapsed_seconds, domain, category
+            FROM browser_context
+            WHERE user_id = ? AND session_id = ? AND recorded_at >= ?
+            ORDER BY recorded_at DESC, id DESC LIMIT 1
+            """,
+            (user_id, session_id, now - max_age_seconds),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def replace_user_analytics(
+        self,
+        user_id: int,
+        daily: list[dict[str, Any]],
+        hourly: list[dict[str, Any]],
+        streaks: list[dict[str, Any]],
+        app_usage: list[dict[str, Any]],
+    ) -> None:
+        with self.connection:
+            self.connection.execute("DELETE FROM daily_summaries WHERE user_id = ?", (user_id,))
+            self.connection.execute("DELETE FROM hourly_activity WHERE user_id = ?", (user_id,))
+            self.connection.execute("DELETE FROM focus_streaks WHERE user_id = ?", (user_id,))
+            self.connection.execute("DELETE FROM app_usage WHERE user_id = ?", (user_id,))
+            self.connection.executemany(
+                """
+                INSERT INTO daily_summaries (
+                    user_id, summary_date, total_focus_seconds, average_score,
+                    observed_seconds, distraction_count, session_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        user_id,
+                        row["date"],
+                        row["total_focus_seconds"],
+                        row["average_score"],
+                        row["observed_seconds"],
+                        row["distraction_count"],
+                        row["session_count"],
+                    )
+                    for row in daily
+                ],
+            )
+            self.connection.executemany(
+                """
+                INSERT INTO hourly_activity (
+                    user_id, activity_date, hour_utc, average_score,
+                    focus_seconds, sample_count
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        user_id,
+                        row["date"],
+                        row["hour"],
+                        row["average_score"],
+                        row["focus_seconds"],
+                        row["sample_count"],
+                    )
+                    for row in hourly
+                ],
+            )
+            self.connection.executemany(
+                """
+                INSERT INTO focus_streaks (
+                    user_id, session_id, started_at, ended_at, duration_seconds
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        user_id,
+                        row["session_id"],
+                        row["started_at"],
+                        row["ended_at"],
+                        row["duration_seconds"],
+                    )
+                    for row in streaks
+                ],
+            )
+            self.connection.executemany(
+                """
+                INSERT INTO app_usage (
+                    user_id, usage_date, app_name, app_category, duration_seconds
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        user_id,
+                        row["date"],
+                        row["app_name"],
+                        row["app_category"],
+                        row["duration_seconds"],
+                    )
+                    for row in app_usage
+                ],
+            )
+
+    def analytics_rows(
+        self, user_id: int, start_date: str, end_date: str
+    ) -> dict[str, list[dict[str, Any]]]:
+        daily = self.connection.execute(
+            """
+            SELECT summary_date AS date, total_focus_seconds, observed_seconds, average_score,
+                   distraction_count, session_count
+            FROM daily_summaries
+            WHERE user_id = ? AND summary_date BETWEEN ? AND ?
+            ORDER BY summary_date
+            """,
+            (user_id, start_date, end_date),
+        ).fetchall()
+        hourly = self.connection.execute(
+            """
+            SELECT activity_date AS date, hour_utc AS hour, average_score,
+                   focus_seconds, sample_count
+            FROM hourly_activity
+            WHERE user_id = ? AND activity_date BETWEEN ? AND ?
+            ORDER BY activity_date, hour_utc
+            """,
+            (user_id, start_date, end_date),
+        ).fetchall()
+        app_usage = self.connection.execute(
+            """
+            SELECT app_name, app_category, SUM(duration_seconds) AS duration_seconds
+            FROM app_usage
+            WHERE user_id = ? AND usage_date BETWEEN ? AND ?
+            GROUP BY app_name, app_category
+            ORDER BY duration_seconds DESC, app_name
+            """,
+            (user_id, start_date, end_date),
+        ).fetchall()
+        streaks = self.connection.execute(
+            """
+            SELECT session_id, started_at, ended_at, duration_seconds
+            FROM focus_streaks
+            WHERE user_id = ? AND date(started_at, 'unixepoch') BETWEEN ? AND ?
+            ORDER BY ended_at DESC, started_at DESC
+            """,
+            (user_id, start_date, end_date),
+        ).fetchall()
+        return {
+            "daily": [dict(row) for row in daily],
+            "hourly": [dict(row) for row in hourly],
+            "app_usage": [dict(row) for row in app_usage],
+            "streaks": [dict(row) for row in streaks],
+        }
+
+    def create_insight(
+        self,
+        user_id: int,
+        session_id: int,
+        insight_type: str,
+        message: str,
+        generated_at: float,
+        source: str = "rules",
+    ) -> dict[str, Any]:
+        if source not in {"rules", "ai"}:
+            raise ValueError("Unsupported insight source")
+        self.connection.execute(
+            """
+            INSERT INTO insights (
+                user_id, session_id, insight_type, message, generated_at, source
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id, insight_type) DO UPDATE SET
+                message = excluded.message,
+                generated_at = excluded.generated_at,
+                source = excluded.source
+            """,
+            (user_id, session_id, insight_type, message, generated_at, source),
+        )
+        self.connection.commit()
+        row = self.connection.execute(
+            """
+            SELECT * FROM insights
+            WHERE user_id = ? AND session_id = ? AND insight_type = ?
+            """,
+            (user_id, session_id, insight_type),
+        ).fetchone()
+        return dict(row)
+
+    def insights_for_user(
+        self, user_id: int, session_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        if session_id is None:
+            rows = self.connection.execute(
+                """
+                SELECT * FROM insights WHERE user_id = ?
+                ORDER BY generated_at DESC, id DESC
+                """,
+                (user_id,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                """
+                SELECT * FROM insights WHERE user_id = ? AND session_id = ?
+                ORDER BY generated_at, id
+                """,
+                (user_id, session_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def dismiss_insight(self, user_id: int, insight_id: int) -> bool:
+        cursor = self.connection.execute(
+            "UPDATE insights SET dismissed = 1 WHERE user_id = ? AND id = ?",
+            (user_id, insight_id),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
     def delete_session(self, session_id: int, user_id: int) -> bool:
         with self.connection:
             exists = self.connection.execute(
@@ -256,6 +678,15 @@ class Database:
             self.connection.execute(
                 "DELETE FROM user_privacy_settings WHERE user_id = ?", (user_id,)
             )
+            for table in (
+                "daily_summaries",
+                "hourly_activity",
+                "app_usage",
+                "app_category_rules",
+            ):
+                self.connection.execute(
+                    f"DELETE FROM {table} WHERE user_id = ?", (user_id,)
+                )
         return len(session_ids)
 
     def export_user_data(self, user_id: int) -> dict[str, Any]:
@@ -286,6 +717,27 @@ class Database:
                 "SELECT * FROM labels WHERE session_id = ? ORDER BY start_elapsed_seconds, id",
                 (session["id"],),
             ).fetchall()
+            browser_rows = self.connection.execute(
+                """
+                SELECT id, recorded_at, elapsed_seconds, domain, category
+                FROM browser_context WHERE session_id = ? ORDER BY recorded_at, id
+                """,
+                (session["id"],),
+            ).fetchall()
+            insight_rows = self.connection.execute(
+                """
+                SELECT id, insight_type, message, generated_at, dismissed, source
+                FROM insights WHERE session_id = ? ORDER BY generated_at, id
+                """,
+                (session["id"],),
+            ).fetchall()
+            biometric_rows = self.connection.execute(
+                """
+                SELECT id, recorded_at, heart_rate, hrv, source_device
+                FROM biometrics WHERE session_id = ? ORDER BY recorded_at, id
+                """,
+                (session["id"],),
+            ).fetchall()
             window_rows = self.connection.execute(
                 "SELECT * FROM feature_windows WHERE session_id = ? ORDER BY start_elapsed_seconds, id",
                 (session["id"],),
@@ -303,6 +755,9 @@ class Database:
                     "telemetry": telemetry,
                     "labels": [dict(row) for row in label_rows],
                     "feature_windows": windows,
+                    "browser_context": [dict(row) for row in browser_rows],
+                    "insights": [dict(row) for row in insight_rows],
+                    "biometrics": [dict(row) for row in biometric_rows],
                 }
             )
         return {"exported_at": time(), "sessions": exported_sessions}
@@ -347,6 +802,30 @@ class Database:
                 DELETE FROM labels
                 WHERE created_at < ?
                   AND session_id IN (SELECT id FROM sessions WHERE user_id = ?)
+                """,
+                (cutoff, user_id),
+            )
+            self.connection.execute(
+                """
+                DELETE FROM browser_context
+                WHERE recorded_at < ?
+                  AND user_id = ?
+                """,
+                (cutoff, user_id),
+            )
+            self.connection.execute(
+                """
+                DELETE FROM biometrics
+                WHERE recorded_at < ?
+                  AND session_id IN (SELECT id FROM sessions WHERE user_id = ?)
+                """,
+                (cutoff, user_id),
+            )
+            self.connection.execute(
+                """
+                DELETE FROM insights
+                WHERE generated_at < ?
+                  AND user_id = ?
                 """,
                 (cutoff, user_id),
             )

@@ -264,6 +264,14 @@ def test_database_explorer_lists_tables_and_redacts_sensitive_columns(tmp_path) 
         "labels",
         "model_versions",
         "user_privacy_settings",
+        "daily_summaries",
+        "hourly_activity",
+        "focus_streaks",
+        "app_usage",
+        "app_category_rules",
+        "browser_context",
+        "insights",
+        "biometrics",
     }
     assert users["total"] == 1
     assert users["rows"][0]["email"] == "alice@example.com"

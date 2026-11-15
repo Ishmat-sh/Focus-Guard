@@ -48,3 +48,12 @@ def test_fatigue_estimator_rejects_non_monotonic_timestamps() -> None:
 
     with pytest.raises(ValueError, match="non-decreasing"):
         estimator.update(0.3, now=1)
+
+
+def test_yawn_detection_requires_a_sustained_open_mouth_and_counts_once() -> None:
+    estimator = FatigueEstimator(yawn_duration_seconds=1.0)
+
+    assert estimator.update(0.3, mouth_aspect_ratio=0.7, now=0).yawn_count == 0
+    assert estimator.update(0.3, mouth_aspect_ratio=0.7, now=1.1).yawn_count == 1
+    assert estimator.update(0.3, mouth_aspect_ratio=0.7, now=2.2).yawn_count == 1
+    assert estimator.update(0.3, mouth_aspect_ratio=0.2, now=2.3).yawn_count == 1

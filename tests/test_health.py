@@ -373,6 +373,120 @@ def test_privacy_export_delete_and_retention_endpoints() -> None:
     assert client.get("/history", headers=owner_headers).json() == []
 
 
+def test_browser_domain_bridge_requires_local_token_and_stores_domain_only(
+    monkeypatch,
+) -> None:
+    class FakeAnalyzer:
+        def process(self, frame):
+            return VisionSnapshot(
+                face_present=True,
+                blink_rate=0.0,
+                ear=0.3,
+                gaze="looking_at_screen",
+            )
+
+    monkeypatch.setenv("FOCUS_GUARD_BROWSER_TOKEN", "test-local-browser-secret")
+    monkeypatch.setattr("backend.main.get_active_application", lambda: "YouTube - Google Chrome")
+    monkeypatch.setattr("backend.main._face_analyzer_for", lambda user_id: FakeAnalyzer())
+    client = TestClient(app, client=("127.0.0.1", 50000))
+    headers = register_user(client, f"browser-{uuid4().hex}@example.com")
+    session_id = client.post("/sessions/start", headers=headers).json()["id"]
+
+    assert client.post(
+        f"/sessions/{session_id}/context/browser",
+        json={"domain": "www.youtube.com"},
+    ).status_code == 401
+    rule = client.put(
+        "/context/category-rules",
+        headers=headers,
+        json={
+            "rule_type": "domain",
+            "rule_value": "youtube.com",
+            "category": "distracting",
+        },
+    )
+    assert rule.status_code == 200
+    assert rule.json()["rule_value"] == "youtube.com"
+    assert client.post(
+        f"/sessions/{session_id}/context/browser",
+        headers={"X-Focus-Guard-Token": "test-local-browser-secret"},
+        json={"domain": "www.youtube.com"},
+    ).json()["category"] == "distracting"
+    assert client.post(
+        f"/sessions/{session_id}/context/browser",
+        headers={"X-Focus-Guard-Token": "test-local-browser-secret"},
+        json={"domain": "https://youtube.com/watch?v=private"},
+    ).status_code == 422
+
+    success, encoded = cv2.imencode(".jpg", np.zeros((32, 32, 3), dtype=np.uint8))
+    assert success
+    score = client.post(
+        "/attention/frame",
+        content=encoded.tobytes(),
+        headers={**headers, "Content-Type": "image/jpeg"},
+    )
+
+    assert score.status_code == 200
+    assert score.json()["app_category"] == "distracting"
+    context_rows = main.database.connection.execute(
+        "SELECT domain, category FROM browser_context"
+    ).fetchall()
+    assert [dict(row) for row in context_rows] == [
+        {"domain": "www.youtube.com", "category": "distracting"}
+    ]
+    assert "private" not in repr(context_rows)
+    assert client.get("/context/browser", headers=headers).json()["domain"] == "www.youtube.com"
+
+
+def test_analytics_endpoints_are_authenticated_and_return_empty_cells() -> None:
+    client = TestClient(app)
+    headers = register_user(client, f"analytics-{uuid4().hex}@example.com")
+
+    assert client.get("/analytics/weekly").status_code == 401
+    weekly = client.get("/analytics/weekly", headers=headers)
+    assert weekly.status_code == 200
+    assert weekly.json()["daily"] == []
+    assert weekly.json()["comparison"]["current"]["total_focus_seconds"] == 0
+    heatmap = client.get("/analytics/heatmap", headers=headers)
+    assert heatmap.status_code == 200
+    assert len(heatmap.json()["cells"]) == 168
+    assert all(cell["average_score"] is None for cell in heatmap.json()["cells"])
+    assert client.get(
+        "/analytics/weekly?start_date=2025-03-10&end_date=2025-03-01",
+        headers=headers,
+    ).status_code == 422
+
+
+def test_insights_are_scoped_and_can_be_dismissed(isolate_api_database) -> None:
+    client = TestClient(app)
+    email = f"insights-{uuid4().hex}@example.com"
+    headers = register_user(client, email)
+    other_headers = register_user(client, f"no-insights-{uuid4().hex}@example.com")
+    user_id = isolate_api_database.connection.execute(
+        "SELECT id FROM users WHERE email = ?", (email,)
+    ).fetchone()["id"]
+    session_id = client.post("/sessions/start", headers=headers).json()["id"]
+    isolate_api_database.create_insight(
+        user_id,
+        session_id,
+        "low_focus",
+        "Consider taking a break.",
+        1_000.0,
+    )
+
+    insights = client.get("/insights", headers=headers)
+    assert insights.status_code == 200
+    insight_id = insights.json()[0]["id"]
+    assert client.get("/insights", headers=other_headers).json() == []
+    assert client.post(
+        f"/insights/{insight_id}/dismiss", headers=other_headers
+    ).status_code == 404
+    assert client.post(
+        f"/insights/{insight_id}/dismiss", headers=headers
+    ).json() == {"ok": True}
+    assert client.get("/insights", headers=headers).json()[0]["dismissed"] == 1
+
+
 def test_user_registration_and_login_endpoints() -> None:
     client = TestClient(app)
     email = f"auth-{uuid4().hex}@example.com"

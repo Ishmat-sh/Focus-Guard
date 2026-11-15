@@ -21,6 +21,19 @@ class VisionSnapshot:
     gaze_offset_y: float | None = None
     posture: str = "unknown"
     posture_score: float | None = None
+    mouth_aspect_ratio: float | None = None
+
+
+def mouth_aspect_ratio(
+    upper_lip: tuple[float, float],
+    lower_lip: tuple[float, float],
+    left_corner: tuple[float, float],
+    right_corner: tuple[float, float],
+) -> float:
+    width = dist(left_corner, right_corner)
+    if width <= 0:
+        raise ValueError("Mouth corner landmarks must be distinct")
+    return dist(upper_lip, lower_lip) / width
 
 
 def eye_aspect_ratio(eye: list[tuple[float, float]]) -> float:
@@ -134,6 +147,15 @@ class FaceAnalyzer:
             vertical_ratio = 1.0 - min(abs(self.snapshot.gaze_offset_y), 1.0)
             self.snapshot.gaze = gaze_state(horizontal_ratio, vertical_ratio)
 
+            try:
+                self.snapshot.mouth_aspect_ratio = mouth_aspect_ratio(
+                    (landmarks[13].x, landmarks[13].y),
+                    (landmarks[14].x, landmarks[14].y),
+                    (landmarks[78].x, landmarks[78].y),
+                    (landmarks[308].x, landmarks[308].y),
+                )
+            except ValueError:
+                self.snapshot.mouth_aspect_ratio = None
             self.snapshot.posture = "unknown"
         except (ImportError, AttributeError, TypeError, ValueError):
             self.snapshot.face_present = False
