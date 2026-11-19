@@ -24,6 +24,8 @@ def isolate_api_database(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "last_active_applications", {})
     monkeypatch.setattr(main, "user_model_inferences", {})
     monkeypatch.setattr(main, "user_model_errors", {})
+    monkeypatch.setattr(main, "user_focused_baselines", {})
+    monkeypatch.setattr(main, "user_focused_baseline_errors", {})
     monkeypatch.setattr(main, "user_frame_history", {})
     monkeypatch.setattr(main, "user_fatigue_estimators", {})
     monkeypatch.setattr(main, "user_fatigue_snapshots", {})
@@ -196,6 +198,8 @@ def test_attention_frame_endpoint_uses_analyzed_camera_signals(monkeypatch) -> N
     assert response.json()["app_category"] == "distracting"
     assert response.json()["scorer"] == "rules"
     assert response.json()["confidence"] is None
+    assert response.json()["focus_baseline_status"] == "unavailable"
+    assert response.json()["focus_baseline_normality_score"] is None
 
 
 def test_consent_gated_labels_and_dataset_export(monkeypatch, isolate_api_database) -> None:

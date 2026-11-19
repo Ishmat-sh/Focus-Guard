@@ -90,7 +90,7 @@ class FaceAnalyzer:
             self._blink_times.popleft()
         return len(self._blink_times)
 
-    def process(self, frame) -> VisionSnapshot:
+    def process(self, frame, now: float | None = None) -> VisionSnapshot:
         self.snapshot = VisionSnapshot()
         try:
             import mediapipe as mp
@@ -114,7 +114,7 @@ class FaceAnalyzer:
             right_ear = eye_aspect_ratio([(lm.x, lm.y) for lm in right_eye])
             self.snapshot.ear = (left_ear + right_ear) / 2.0
             eyes_closed = detect_blink(self.snapshot.ear, threshold=self.ear_threshold)
-            self.snapshot.blink_count = self._record_blink_state(eyes_closed)
+            self.snapshot.blink_count = self._record_blink_state(eyes_closed, now)
             self.snapshot.blink_rate = float(self.snapshot.blink_count)
 
             nose = landmarks[1]

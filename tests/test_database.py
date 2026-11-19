@@ -1,7 +1,9 @@
 import sqlite3
 
+from backend.analytics.service import refresh_user_analytics
 from backend.core.scoring import AttentionResult, AttentionState
 from backend.core.session import Session, SessionManager, SessionState
+from backend.features.schema import FEATURE_FIELDS
 from backend.storage.database import Database
 
 
@@ -228,6 +230,75 @@ def test_delete_user_removes_tokens_sessions_and_telemetry(tmp_path) -> None:
     assert database.user_history(user["id"]) == []
     assert database.user_history(other_user["id"])[0]["id"] == other_session.id
     assert database.connection.execute("SELECT COUNT(*) FROM telemetry").fetchone()[0] == 1
+
+
+def test_delete_session_removes_all_session_data_and_rebuilds_analytics(tmp_path) -> None:
+    database = Database(tmp_path / "focus_guard.db")
+    user = database.create_user("Delete Session", "session@example.com", "safe-password")
+    session = Session(
+        id=1,
+        state=SessionState.RUNNING,
+        started_at=100.0,
+    )
+    database.save_session(session, user["id"])
+    assert database.set_collection_consent(session.id, user["id"], True)
+    features = {
+        field: "unknown" if field == "active_app_category" else 0.0
+        for field in FEATURE_FIELDS
+    }
+    database.save_feature_window(session.id, 0.0, 10.0, features)
+    database.create_label(session.id, user["id"], 0.0, 10.0, "focused")
+    assert database.save_browser_context(session.id, "example.com", 101.0, 1.0)
+    database.create_insight(user["id"], session.id, "test", "Test insight", 101.0)
+    database.connection.execute(
+        """
+        INSERT INTO biometrics (session_id, recorded_at, heart_rate, hrv, source_device)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (session.id, 101.0, 70.0, 45.0, "test-device"),
+    )
+    result = AttentionResult(90.0, AttentionState.FOCUSED, 90.0, "Editor", "productive")
+    for recorded_at, elapsed in ((100.0, 0.0), (110.0, 10.0)):
+        database.save_telemetry(
+            session.id,
+            recorded_at,
+            result,
+            True,
+            elapsed_seconds=elapsed,
+        )
+    database.connection.commit()
+    refresh_user_analytics(database, user["id"])
+
+    tables = (
+        "telemetry",
+        "collection_consents",
+        "feature_windows",
+        "labels",
+        "focus_streaks",
+        "browser_context",
+        "insights",
+        "biometrics",
+    )
+    assert all(
+        database.connection.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE session_id = ?", (session.id,)
+        ).fetchone()[0]
+        for table in tables
+    )
+
+    assert database.delete_session(session.id, user["id"])
+    refresh_user_analytics(database, user["id"])
+
+    assert all(
+        database.connection.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE session_id = ?", (session.id,)
+        ).fetchone()[0]
+        == 0
+        for table in tables
+    )
+    assert database.analytics_rows(user["id"], "1970-01-01", "1970-01-02")[
+        "daily"
+    ] == []
 
 
 def test_legacy_plaintext_password_is_upgraded_on_successful_login(tmp_path) -> None:

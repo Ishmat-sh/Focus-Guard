@@ -33,6 +33,11 @@ from backend.analytics.service import (
 )
 from backend.core.scoring import AttentionResult, AttentionScorer, AttentionState, VisionSignals
 from backend.core.session import SessionManager
+from backend.ml.focused import FocusedBaselineInference, MODEL_NAME as FOCUSED_BASELINE_MODEL_NAME
+from backend.ml.daisee import (
+    DaiseeEngagementInference,
+    MODEL_NAME as DAISEE_ENGAGEMENT_MODEL_NAME,
+)
 from backend.ml.inference import ModelInference
 from backend.features.schema import FEATURE_FIELDS, FEATURE_SCHEMA_VERSION
 from backend.features.windows import compute_window_features
@@ -112,6 +117,10 @@ user_alerts: dict[int, AlertManager] = {}
 last_active_applications: dict[int, str] = {}
 user_model_inferences: dict[int, ModelInference] = {}
 user_model_errors: dict[int, str] = {}
+user_focused_baselines: dict[int, FocusedBaselineInference] = {}
+user_focused_baseline_errors: dict[int, str] = {}
+user_daisee_engagement_models: dict[int, DaiseeEngagementInference] = {}
+user_daisee_engagement_errors: dict[int, str] = {}
 user_frame_history: dict[int, tuple[int, deque[dict[str, Any]]]] = {}
 user_fatigue_estimators: dict[int, FatigueEstimator] = {}
 user_fatigue_snapshots: dict[int, FatigueSnapshot] = {}
@@ -170,6 +179,10 @@ def start_session(user: dict[str, object] = Depends(require_ready_user)) -> dict
             last_active_applications.pop(user_id, None)
             user_model_inferences.pop(user_id, None)
             user_model_errors.pop(user_id, None)
+            user_focused_baselines.pop(user_id, None)
+            user_focused_baseline_errors.pop(user_id, None)
+            user_daisee_engagement_models.pop(user_id, None)
+            user_daisee_engagement_errors.pop(user_id, None)
             user_frame_history.pop(user_id, None)
             user_fatigue_estimators.pop(user_id, None)
             user_fatigue_snapshots.pop(user_id, None)
@@ -208,6 +221,10 @@ def end_session(user: dict[str, object] = Depends(require_ready_user)) -> dict[s
     last_active_applications.pop(user_id, None)
     user_model_inferences.pop(user_id, None)
     user_model_errors.pop(user_id, None)
+    user_focused_baselines.pop(user_id, None)
+    user_focused_baseline_errors.pop(user_id, None)
+    user_daisee_engagement_models.pop(user_id, None)
+    user_daisee_engagement_errors.pop(user_id, None)
     user_frame_history.pop(user_id, None)
     user_fatigue_estimators.pop(user_id, None)
     user_fatigue_snapshots.pop(user_id, None)
@@ -257,6 +274,12 @@ def analyze_attention_frame(
     inference_ms: float | None = None
     active_scorer = "rules"
     fallback_reason: str | None = None
+    focus_baseline_status = "unavailable"
+    focus_baseline_normality_score: float | None = None
+    focus_baseline_error: str | None = None
+    daisee_engagement_status = "unavailable"
+    daisee_engagement_level: int | None = None
+    daisee_engagement_error: str | None = None
     fatigue = _empty_fatigue_snapshot()
     with runtime_lock:
         session = _session_manager_for(user_id).snapshot()
@@ -323,6 +346,25 @@ def analyze_attention_frame(
                     samples = history[1]
                 samples.append(frame_sample | {"elapsed_seconds": session.elapsed_seconds})
 
+                (
+                    focus_baseline_status,
+                    focus_baseline_normality_score,
+                    focus_baseline_error,
+                ) = _focused_baseline_prediction_for(
+                    user_id,
+                    session.elapsed_seconds,
+                    samples,
+                )
+                (
+                    daisee_engagement_status,
+                    daisee_engagement_level,
+                    daisee_engagement_error,
+                ) = _daisee_engagement_prediction_for(
+                    user_id,
+                    session.elapsed_seconds,
+                    samples,
+                )
+
                 if scorer_mode == "ml":
                     result, confidence, inference_ms, fallback_reason = _score_with_model(
                         user_id,
@@ -373,6 +415,12 @@ def analyze_attention_frame(
         "confidence": confidence,
         "inference_ms": inference_ms,
         "scorer_fallback_reason": fallback_reason,
+        "focus_baseline_status": focus_baseline_status,
+        "focus_baseline_normality_score": focus_baseline_normality_score,
+        "focus_baseline_error": focus_baseline_error,
+        "daisee_engagement_status": daisee_engagement_status,
+        "daisee_engagement_level": daisee_engagement_level,
+        "daisee_engagement_error": daisee_engagement_error,
         "fatigue_risk": fatigue.risk,
         "fatigue_level": fatigue.level,
         "perclos": fatigue.perclos,
@@ -792,6 +840,10 @@ def delete_user(
         last_active_applications.pop(user_id, None)
         user_model_inferences.pop(user_id, None)
         user_model_errors.pop(user_id, None)
+        user_focused_baselines.pop(user_id, None)
+        user_focused_baseline_errors.pop(user_id, None)
+        user_daisee_engagement_models.pop(user_id, None)
+        user_daisee_engagement_errors.pop(user_id, None)
         user_frame_history.pop(user_id, None)
         user_fatigue_estimators.pop(user_id, None)
         user_fatigue_snapshots.pop(user_id, None)
@@ -955,6 +1007,134 @@ def _model_inference_for(user_id: int) -> ModelInference | None:
         user_model_errors[user_id] = str(error)
         return None
     user_model_inferences[user_id] = model
+    return model
+
+
+def _focused_baseline_prediction_for(
+    user_id: int,
+    elapsed_seconds: float,
+    samples: deque[dict[str, Any]],
+) -> tuple[str, float | None, str | None]:
+    if elapsed_seconds < 10.0:
+        return "warming_up", None, None
+
+    window_start = max(0.0, elapsed_seconds - 10.0)
+    window_samples = [
+        sample
+        for sample in samples
+        if float(sample["elapsed_seconds"]) >= window_start
+    ]
+    if not window_samples or float(window_samples[0]["elapsed_seconds"]) > window_start + 1.0:
+        return "warming_up", None, None
+
+    model = _focused_baseline_for(user_id)
+    if model is None:
+        return "unavailable", None, user_focused_baseline_errors.get(
+            user_id, "No focused-only model is registered"
+        )
+    try:
+        features = compute_window_features(
+            window_samples,
+            window_seconds=10.0,
+            start_elapsed_seconds=window_start,
+        )
+        prediction = model.predict(features)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        logger.exception("Focused-baseline inference failed")
+        user_focused_baseline_errors[user_id] = (
+            "Focused-baseline inference failed; check backend logs"
+        )
+        user_focused_baselines.pop(user_id, None)
+        return "unavailable", None, user_focused_baseline_errors[user_id]
+
+    status = (
+        "matches_focused_baseline"
+        if prediction.matches_focused_baseline
+        else "deviates_from_focused_baseline"
+    )
+    return status, prediction.normality_score, None
+
+
+def _focused_baseline_for(user_id: int) -> FocusedBaselineInference | None:
+    if user_id in user_focused_baselines:
+        return user_focused_baselines[user_id]
+    if user_id in user_focused_baseline_errors:
+        return None
+
+    try:
+        active_version = database.active_model_version(FOCUSED_BASELINE_MODEL_NAME)
+        if active_version is None:
+            return None
+        model = FocusedBaselineInference(Path(active_version["file_path"]))
+    except (AttributeError, EOFError, ImportError, OSError, UnpicklingError, ValueError) as error:
+        logger.warning("Focused-only model unavailable: %s", error)
+        user_focused_baseline_errors[user_id] = (
+            "Focused-only model could not be loaded; check backend logs"
+        )
+        return None
+    user_focused_baselines[user_id] = model
+    return model
+
+
+def _daisee_engagement_prediction_for(
+    user_id: int,
+    elapsed_seconds: float,
+    samples: deque[dict[str, Any]],
+) -> tuple[str, int | None, str | None]:
+    if elapsed_seconds < 10.0:
+        return "warming_up", None, None
+
+    window_start = max(0.0, elapsed_seconds - 10.0)
+    window_samples = [
+        sample
+        for sample in samples
+        if float(sample["elapsed_seconds"]) >= window_start
+    ]
+    if not window_samples or float(window_samples[0]["elapsed_seconds"]) > window_start + 1.0:
+        return "warming_up", None, None
+
+    model = _daisee_engagement_model_for(user_id)
+    if model is None:
+        return "unavailable", None, user_daisee_engagement_errors.get(
+            user_id, "No DAiSEE engagement model is registered"
+        )
+    try:
+        features = compute_window_features(
+            window_samples,
+            window_seconds=10.0,
+            start_elapsed_seconds=window_start,
+        )
+        engagement_level = model.predict(features)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        logger.exception("DAiSEE engagement inference failed")
+        user_daisee_engagement_errors[user_id] = (
+            "DAiSEE engagement inference failed; check backend logs"
+        )
+        user_daisee_engagement_models.pop(user_id, None)
+        return "unavailable", None, user_daisee_engagement_errors[user_id]
+    return "available", engagement_level, None
+
+
+def _daisee_engagement_model_for(
+    user_id: int,
+) -> DaiseeEngagementInference | None:
+    if user_id in user_daisee_engagement_models:
+        return user_daisee_engagement_models[user_id]
+    if user_id in user_daisee_engagement_errors:
+        return None
+
+    try:
+        active_version = database.active_model_version(DAISEE_ENGAGEMENT_MODEL_NAME)
+        if active_version is None:
+            return None
+        model = DaiseeEngagementInference(Path(active_version["file_path"]))
+    except (AttributeError, EOFError, ImportError, OSError, UnpicklingError, ValueError) as error:
+        logger.warning("DAiSEE engagement model unavailable: %s", error)
+        user_daisee_engagement_errors[user_id] = (
+            "DAiSEE engagement model could not be loaded; check backend logs"
+        )
+        return None
+    user_daisee_engagement_models[user_id] = model
     return model
 
 
@@ -1155,6 +1335,10 @@ def _discard_session_runtime(user_id: int, session_id: int | None = None) -> Non
     last_active_applications.pop(user_id, None)
     user_model_inferences.pop(user_id, None)
     user_model_errors.pop(user_id, None)
+    user_focused_baselines.pop(user_id, None)
+    user_focused_baseline_errors.pop(user_id, None)
+    user_daisee_engagement_models.pop(user_id, None)
+    user_daisee_engagement_errors.pop(user_id, None)
     user_frame_history.pop(user_id, None)
     user_fatigue_estimators.pop(user_id, None)
     user_fatigue_snapshots.pop(user_id, None)

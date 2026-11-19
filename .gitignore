@@ -1,10 +1,13 @@
 # Python
 .venv/
+.venv-focused/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
 focus_guard.db
+Dataset/
+models/
 
 # Node
 node_modules/

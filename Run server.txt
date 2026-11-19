@@ -1,5 +1,19 @@
 MAC
 
+Use Python 3.12 for MediaPipe FaceMesh compatibility:
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+
+To train the focused-only baseline locally before starting the backend:
+.venv/bin/python -m backend.ml.focused Dataset
+The binary baseline reports whether a live feature window resembles focused
+recordings; it cannot identify which non-focused state an outlier represents.
+
+To train the DAiSEE engagement-level classifier from the locally supplied videos:
+.venv/bin/python -m backend.ml.daisee Dataset/Unfocused/DAiSEE
+The model predicts DAiSEE's original 0-3 Engagement label. The folder contains
+multiple engagement levels, so it is not treated as entirely unfocused data.
+
 Terminal 1 - Backend
 cd /path/to/Focus-Guard
 export FOCUS_GUARD_DB_PATH="$PWD/focus_guard.db"
@@ -12,8 +26,8 @@ Before sharing extension access with a trusted local browser, set
 FOCUS_GUARD_BROWSER_TOKEN to a private random token. The browser bridge accepts
 domain-only requests from loopback clients; it does not accept or store URLs or titles.
 To create a migration after a schema change, run:
-.venv/bin/python -m alembic revision --autogenerate -m "describe the schema change"
-Review the generated migration, then apply it with:
+.venv/bin/python -m alembic revision -m "describe the schema change"
+Add and review the migration operations, then apply it with:
 .venv/bin/python -m alembic upgrade head
 
 Terminal 2 - Frontend
@@ -30,6 +44,15 @@ For non-local networks, use HTTPS and configure FOCUS_GUARD_CORS_ORIGINS.
 
 
 WINDOWS
+
+Use Python 3.12 for MediaPipe FaceMesh compatibility:
+uv venv --python 3.12 .venv
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+
+Train the focused-only baseline locally before starting the backend:
+.venv\Scripts\python.exe -m backend.ml.focused Dataset
+Train the DAiSEE engagement-level classifier:
+.venv\Scripts\python.exe -m backend.ml.daisee Dataset\Unfocused\DAiSEE
 
 Terminal 1 - Backend
 cd C:\path\to\Focus-Guard

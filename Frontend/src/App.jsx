@@ -752,9 +752,35 @@ function App() {
               </div>
               <div className="vision-box">
                 <span>Posture</span>
-                <strong>Not measured</strong>
+                <strong>{attention.posture || "Unknown"}</strong>
+              </div>
+              <div className="vision-box">
+                <span>Focused-only baseline</span>
+                <strong>
+                  {attention.focus_baseline_status === "matches_focused_baseline"
+                    ? "Matches focused baseline"
+                    : attention.focus_baseline_status === "deviates_from_focused_baseline"
+                      ? "Outside focused baseline"
+                      : attention.focus_baseline_status === "warming_up"
+                        ? "Warming up"
+                        : "Unavailable"}
+                </strong>
+              </div>
+              <div className="vision-box">
+                <span>DAiSEE engagement level (0-3)</span>
+                <strong>
+                  {attention.daisee_engagement_status === "available"
+                    ? `Level ${attention.daisee_engagement_level}`
+                    : attention.daisee_engagement_status === "warming_up"
+                      ? "Warming up"
+                      : "Unavailable"}
+                </strong>
               </div>
             </div>
+            <p className="empty">
+              DAiSEE's 0-3 label estimate is experimental: it missed every held-out level 0
+              and 1 example. Neither output diagnoses focus, distraction, drifting, or fatigue.
+            </p>
           </div>
           {/* HISTORY */}
           <div className="history-section">
