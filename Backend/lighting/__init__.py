@@ -1,0 +1,1 @@
+"""Optional smart-lighting adapters."""

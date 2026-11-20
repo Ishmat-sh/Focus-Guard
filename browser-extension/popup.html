@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Focus Guard Context</title>
+    <style>
+      body { width: 280px; margin: 0; padding: 16px; font: 14px Arial, sans-serif; color: #222; }
+      label { display: block; margin: 10px 0 4px; font-weight: bold; }
+      input { width: 100%; box-sizing: border-box; padding: 8px; }
+      button { width: 100%; margin-top: 12px; padding: 9px; border: 0; border-radius: 5px; background: #4a67d6; color: white; }
+      #status { margin-top: 10px; min-height: 32px; color: #555; }
+      small { display: block; margin-top: 12px; color: #777; }
+    </style>
+  </head>
+  <body>
+    <h2>Focus Guard</h2>
+    <label for="backend">Backend URL</label>
+    <input id="backend" value="http://127.0.0.1:8000">
+    <label for="sessionId">Session ID</label>
+    <input id="sessionId" inputmode="numeric" placeholder="Running session ID">
+    <label for="localToken">Local bridge token</label>
+    <input id="localToken" type="password" placeholder="FOCUS_GUARD_BROWSER_TOKEN">
+    <button id="save">Save and connect</button>
+    <div id="status">Not connected.</div>
+    <small>Only the active tab domain is sent. URLs, titles and page content are never read or transmitted.</small>
+    <script src="popup.js"></script>
+  </body>
+</html>

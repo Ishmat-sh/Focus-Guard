@@ -41,6 +41,7 @@ from backend.ml.daisee import (
 from backend.ml.inference import ModelInference
 from backend.features.schema import FEATURE_FIELDS, FEATURE_SCHEMA_VERSION
 from backend.features.windows import compute_window_features
+from backend.lighting.base import HttpLightingAdapter
 from backend.storage.database import Database
 from backend.vision.analyzer import FaceAnalyzer
 
@@ -79,6 +80,33 @@ class RetentionRequest(BaseModel):
     retention_days: int | None = Field(default=None, ge=1, le=3650)
 
 
+class ScorerModeRequest(BaseModel):
+    mode: Literal["rules", "ml"]
+
+
+class InsightFeedbackRequest(BaseModel):
+    feedback: Literal["helpful", "not_helpful"]
+
+
+class BiometricRequest(BaseModel):
+    session_id: int = Field(ge=1)
+    timestamp: float = Field(ge=0)
+    heart_rate: float = Field(gt=0)
+    hrv: float | None = Field(default=None, ge=0)
+    source_device: str = Field(min_length=1, max_length=200)
+
+
+class SyncRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=200)
+    device_name: str | None = Field(default=None, max_length=200)
+    enabled: bool
+
+
+class LightingRequest(BaseModel):
+    endpoint: str = Field(min_length=1, max_length=2048)
+    state: Literal["focused", "break", "idle"]
+
+
 class BrowserContextRequest(BaseModel):
     domain: str = Field(min_length=1, max_length=253)
 
@@ -101,7 +129,7 @@ configured_origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", *configured_origins],
-    allow_origin_regex=r"^http://(?:localhost|127\.0\.0\.1|(?:\d{1,3}\.){3}\d{1,3}):5173$",
+    allow_origin_regex=r"^(?:http://(?:localhost|127\.0\.0\.1|(?:\d{1,3}\.){3}\d{1,3}):5173|chrome-extension://[a-pA-P]{32})$",
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -124,6 +152,8 @@ user_daisee_engagement_errors: dict[int, str] = {}
 user_frame_history: dict[int, tuple[int, deque[dict[str, Any]]]] = {}
 user_fatigue_estimators: dict[int, FatigueEstimator] = {}
 user_fatigue_snapshots: dict[int, FatigueSnapshot] = {}
+user_scorer_modes: dict[int, str] = {}
+lighting_adapters: dict[int, HttpLightingAdapter] = {}
 runtime_lock = RLock()
 scorer_mode = os.getenv("FOCUS_GUARD_SCORER", "rules").strip().lower()
 if scorer_mode not in {"rules", "ml"}:
@@ -365,7 +395,7 @@ def analyze_attention_frame(
                     samples,
                 )
 
-                if scorer_mode == "ml":
+                if user_scorer_modes.get(user_id, scorer_mode) == "ml":
                     result, confidence, inference_ms, fallback_reason = _score_with_model(
                         user_id,
                         session.id,
@@ -444,6 +474,21 @@ def set_collection_consent(
     return {
         "session_id": session_id,
         "consent": payload.consent,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+    }
+
+
+@app.get("/sessions/{session_id}/collection")
+def get_collection_status(
+    session_id: int,
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, object]:
+    user_id = int(user["id"])
+    if database.session_for_user(session_id, user_id) is None:
+        raise HTTPException(404, "Session not found")
+    return {
+        "session_id": session_id,
+        "consent": database.collection_is_consented(session_id, user_id),
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
     }
 
@@ -746,6 +791,138 @@ def dismiss_insight(
     if not database.dismiss_insight(int(user["id"]), insight_id):
         raise HTTPException(404, "Insight not found")
     return {"ok": True}
+
+
+@app.post("/insights/{insight_id}/feedback")
+def set_insight_feedback(
+    insight_id: int,
+    payload: InsightFeedbackRequest,
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, bool]:
+    if not database.set_insight_feedback(
+        int(user["id"]),
+        insight_id,
+        payload.feedback,
+    ):
+        raise HTTPException(404, "Insight not found")
+    return {"ok": True}
+
+
+@app.get("/scorer")
+def get_scorer_status(
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, object]:
+    user_id = int(user["id"])
+    mode = user_scorer_modes.get(user_id, scorer_mode)
+    active_version = database.active_model_version("focus_guard")
+    model_available = bool(
+        active_version
+        and active_version.get("file_path")
+        and Path(str(active_version["file_path"])).exists()
+    )
+    effective_mode = "ml" if mode == "ml" and model_available else mode
+    if mode == "ml" and not model_available:
+        effective_mode = "rules"
+    return {
+        "configured_mode": mode,
+        "effective_mode": effective_mode,
+        "model_available": model_available,
+        "model_version": active_version["version"] if active_version else None,
+        "model_path": active_version["file_path"] if active_version else None,
+        "fallback_reason": (
+            None
+            if effective_mode != "rules" or mode != "ml"
+            else "The active ML model file is unavailable"
+        ),
+    }
+
+
+@app.put("/scorer")
+def set_scorer_status(
+    payload: ScorerModeRequest,
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, object]:
+    user_id = int(user["id"])
+    user_scorer_modes[user_id] = payload.mode
+    user_model_inferences.pop(user_id, None)
+    user_model_errors.pop(user_id, None)
+    return get_scorer_status(user)
+
+
+@app.get("/metrics")
+@app.post("/biometrics")
+def save_biometric(
+    payload: BiometricRequest,
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, object]:
+    result = database.save_biometric(
+        payload.session_id,
+        int(user["id"]),
+        payload.timestamp,
+        payload.heart_rate,
+        payload.hrv,
+        payload.source_device,
+    )
+    if result is None:
+        raise HTTPException(404, "Session not found")
+    return result
+
+
+@app.get("/biometrics")
+def get_biometrics(
+    session_id: int | None = Query(default=None, ge=1),
+    user: dict[str, object] = Depends(require_ready_user),
+) -> list[dict[str, object]]:
+    return database.latest_biometrics(int(user["id"]), session_id)
+
+
+@app.get("/sync")
+def get_sync_status(
+    user: dict[str, object] = Depends(require_ready_user),
+) -> list[dict[str, object]]:
+    return database.sync_state_for_user(int(user["id"]))
+
+
+@app.put("/sync")
+def configure_sync(
+    payload: SyncRequest,
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, object]:
+    return database.set_sync_state(
+        int(user["id"]),
+        payload.device_id,
+        payload.device_name,
+        payload.enabled,
+    )
+
+
+@app.get("/sync/export")
+def sync_export(
+    device_id: str = Query(min_length=1, max_length=200),
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, object]:
+    states = database.sync_state_for_user(int(user["id"]))
+    state = next(
+        (item for item in states if item["device_id"] == device_id),
+        None,
+    )
+    if state is None or not bool(state["enabled"]):
+        raise HTTPException(409, "Cloud sync is disabled for this device")
+    return database.export_user_data(int(user["id"]))
+
+
+@app.put("/lighting")
+def configure_lighting(
+    payload: LightingRequest,
+    user: dict[str, object] = Depends(require_ready_user),
+) -> dict[str, object]:
+    try:
+        adapter = HttpLightingAdapter(payload.endpoint)
+        adapter.set_state(payload.state)
+    except (ValueError, OSError, RuntimeError) as error:
+        raise HTTPException(502, f"Lighting API unavailable: {error}") from error
+    lighting_adapters[int(user["id"])] = adapter
+    return {"ok": True, "state": payload.state}
 
 
 @app.get("/metrics")

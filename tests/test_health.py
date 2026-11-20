@@ -29,6 +29,8 @@ def isolate_api_database(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "user_frame_history", {})
     monkeypatch.setattr(main, "user_fatigue_estimators", {})
     monkeypatch.setattr(main, "user_fatigue_snapshots", {})
+    monkeypatch.setattr(main, "user_scorer_modes", {})
+    monkeypatch.setattr(main, "lighting_adapters", {})
     monkeypatch.setattr(main, "scorer_mode", "rules")
     yield test_database
     test_database.connection.close()
@@ -202,6 +204,26 @@ def test_attention_frame_endpoint_uses_analyzed_camera_signals(monkeypatch) -> N
     assert response.json()["focus_baseline_normality_score"] is None
 
 
+def test_scorer_status_and_per_user_toggle(isolate_api_database) -> None:
+    client = TestClient(app)
+    headers = register_user(client, f"scorer-{uuid4().hex}@example.com")
+
+    initial = client.get("/scorer", headers=headers)
+    assert initial.status_code == 200
+    assert initial.json()["configured_mode"] == "rules"
+    assert initial.json()["effective_mode"] == "rules"
+
+    changed = client.put("/scorer", headers=headers, json={"mode": "ml"})
+    assert changed.status_code == 200
+    assert changed.json()["configured_mode"] == "ml"
+    assert changed.json()["effective_mode"] == "rules"
+    assert changed.json()["fallback_reason"]
+
+    restored = client.put("/scorer", headers=headers, json={"mode": "rules"})
+    assert restored.status_code == 200
+    assert restored.json()["effective_mode"] == "rules"
+
+
 def test_consent_gated_labels_and_dataset_export(monkeypatch, isolate_api_database) -> None:
     class FakeAnalyzer:
         def process(self, frame):
@@ -247,6 +269,12 @@ def test_consent_gated_labels_and_dataset_export(monkeypatch, isolate_api_databa
     )
     assert consent.status_code == 200
     assert consent.json()["consent"] is True
+    status = client.get(
+        f"/sessions/{session_id}/collection",
+        headers=headers,
+    )
+    assert status.status_code == 200
+    assert status.json()["consent"] is True
 
     sleep(0.02)
     success, encoded = cv2.imencode(".jpg", np.zeros((32, 32, 3), dtype=np.uint8))
@@ -488,7 +516,53 @@ def test_insights_are_scoped_and_can_be_dismissed(isolate_api_database) -> None:
     assert client.post(
         f"/insights/{insight_id}/dismiss", headers=headers
     ).json() == {"ok": True}
-    assert client.get("/insights", headers=headers).json()[0]["dismissed"] == 1
+    assert client.post(
+        f"/insights/{insight_id}/feedback",
+        headers=other_headers,
+        json={"feedback": "not_helpful"},
+    ).status_code == 404
+    assert client.post(
+        f"/insights/{insight_id}/feedback",
+        headers=headers,
+        json={"feedback": "not_helpful"},
+    ).json() == {"ok": True}
+    updated = client.get("/insights", headers=headers).json()[0]
+    assert updated["dismissed"] == 1
+    assert updated["feedback"] == "not_helpful"
+
+
+def test_sync_is_opt_in_and_scoped_to_device(isolate_api_database) -> None:
+    client = TestClient(app)
+    headers = register_user(client, f"sync-{uuid4().hex}@example.com")
+
+    assert client.get("/sync", headers=headers).json() == []
+    disabled = client.put(
+        "/sync",
+        headers=headers,
+        json={"device_id": "browser-a", "device_name": "Test Browser", "enabled": False},
+    )
+    assert disabled.status_code == 200
+    assert disabled.json()["enabled"] == 0
+    assert client.get(
+        "/sync/export",
+        headers=headers,
+        params={"device_id": "browser-a"},
+    ).status_code == 409
+
+    enabled = client.put(
+        "/sync",
+        headers=headers,
+        json={"device_id": "browser-a", "device_name": "Test Browser", "enabled": True},
+    )
+    assert enabled.status_code == 200
+    assert enabled.json()["enabled"] == 1
+    exported = client.get(
+        "/sync/export",
+        headers=headers,
+        params={"device_id": "browser-a"},
+    )
+    assert exported.status_code == 200
+    assert "sessions" in exported.json()
 
 
 def test_user_registration_and_login_endpoints() -> None:

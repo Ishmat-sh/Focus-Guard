@@ -343,6 +343,8 @@ def test_database_explorer_lists_tables_and_redacts_sensitive_columns(tmp_path) 
         "browser_context",
         "insights",
         "biometrics",
+        "devices",
+        "sync_state",
     }
     assert users["total"] == 1
     assert users["rows"][0]["email"] == "alice@example.com"

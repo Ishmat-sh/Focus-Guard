@@ -4,11 +4,14 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import sqlite3
 from pathlib import Path
 from time import time
 from typing import Any
+
+import jwt
 
 from backend.context.categories import categorize_application
 from backend.features.schema import FEATURE_SCHEMA_VERSION, validate_feature_vector
@@ -16,6 +19,7 @@ from backend.features.schema import FEATURE_SCHEMA_VERSION, validate_feature_vec
 
 class Database:
     _PASSWORD_ITERATIONS = 310_000
+    _JWT_SECRET = os.getenv("FOCUS_GUARD_JWT_SECRET") or secrets.token_hex(32)
     SCHEMA_VERSION = 3
 
     def __init__(self, path: str | Path = "focus_guard.db") -> None:
@@ -76,6 +80,14 @@ class Database:
                 "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0"
             )
         self._migrate_phase2_schema()
+        insight_columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(insights)")
+        }
+        if "feedback" not in insight_columns:
+            self.connection.execute(
+                "ALTER TABLE insights ADD COLUMN feedback TEXT"
+            )
         self.connection.commit()
 
     def _migrate_phase2_schema(self) -> None:
@@ -220,6 +232,7 @@ class Database:
                 generated_at REAL NOT NULL,
                 dismissed INTEGER NOT NULL DEFAULT 0 CHECK(dismissed IN (0, 1)),
                 source TEXT NOT NULL DEFAULT 'rules' CHECK(source IN ('rules', 'ai')),
+                feedback TEXT CHECK(feedback IS NULL OR feedback IN ('helpful', 'not_helpful')),
                 UNIQUE(session_id, insight_type)
             );
             CREATE TABLE IF NOT EXISTS biometrics (
@@ -229,6 +242,24 @@ class Database:
                 heart_rate REAL NOT NULL CHECK(heart_rate > 0),
                 hrv REAL CHECK(hrv IS NULL OR hrv >= 0),
                 source_device TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                device_id TEXT NOT NULL,
+                name TEXT,
+                created_at REAL NOT NULL,
+                last_seen_at REAL,
+                UNIQUE(user_id, device_id)
+            );
+            CREATE TABLE IF NOT EXISTS sync_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                device_id TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+                last_synced_at REAL,
+                last_error TEXT,
+                UNIQUE(user_id, device_id)
             );
             CREATE INDEX IF NOT EXISTS idx_browser_context_session_time
                 ON browser_context(session_id, recorded_at);
@@ -642,6 +673,138 @@ class Database:
         )
         self.connection.commit()
         return cursor.rowcount > 0
+
+    def set_insight_feedback(
+        self,
+        user_id: int,
+        insight_id: int,
+        feedback: str,
+    ) -> bool:
+        if feedback not in {"helpful", "not_helpful"}:
+            raise ValueError("Unsupported insight feedback")
+        cursor = self.connection.execute(
+            "UPDATE insights SET feedback = ? WHERE user_id = ? AND id = ?",
+            (feedback, user_id, insight_id),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
+    def save_biometric(
+        self,
+        session_id: int,
+        user_id: int,
+        timestamp: float,
+        heart_rate: float,
+        hrv: float | None,
+        source_device: str,
+    ) -> dict[str, Any] | None:
+        session = self.session_for_user(session_id, user_id)
+        if session is None:
+            return None
+        if heart_rate < 0 or (hrv is not None and hrv < 0):
+            raise ValueError("Heart rate and HRV must be non-negative")
+        cursor = self.connection.execute(
+            """
+            INSERT INTO biometrics (
+                recorded_at, session_id, heart_rate, hrv, source_device
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (timestamp, session_id, heart_rate, hrv, source_device),
+        )
+        self.connection.commit()
+        row = self.connection.execute(
+            "SELECT * FROM biometrics WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+        return dict(row)
+
+    def latest_biometrics(
+        self,
+        user_id: int,
+        session_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if session_id is None:
+            rows = self.connection.execute(
+                """
+                SELECT biometrics.*
+                FROM biometrics
+                JOIN sessions ON sessions.id = biometrics.session_id
+                WHERE sessions.user_id = ?
+                ORDER BY biometrics.recorded_at DESC
+                LIMIT 100
+                """,
+                (user_id,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                """
+                SELECT biometrics.*
+                FROM biometrics
+                JOIN sessions ON sessions.id = biometrics.session_id
+                WHERE sessions.user_id = ? AND biometrics.session_id = ?
+                ORDER BY biometrics.recorded_at DESC
+                LIMIT 100
+                """,
+                (user_id, session_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_sync_state(
+        self,
+        user_id: int,
+        device_id: str,
+        device_name: str | None,
+        enabled: bool,
+    ) -> dict[str, Any]:
+        now = time()
+        self.connection.execute(
+            """
+            INSERT INTO devices (user_id, device_id, name, created_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, device_id) DO UPDATE SET
+                name = COALESCE(excluded.name, devices.name),
+                last_seen_at = excluded.last_seen_at
+            """,
+            (user_id, device_id, device_name, now, now),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO sync_state (user_id, device_id, enabled)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, device_id) DO UPDATE SET enabled = excluded.enabled
+            """,
+            (user_id, device_id, int(enabled)),
+        )
+        self.connection.commit()
+        row = self.connection.execute(
+            """
+            SELECT devices.device_id, devices.name, devices.last_seen_at,
+                   sync_state.enabled, sync_state.last_synced_at, sync_state.last_error
+            FROM devices
+            JOIN sync_state
+              ON sync_state.user_id = devices.user_id
+             AND sync_state.device_id = devices.device_id
+            WHERE devices.user_id = ? AND devices.device_id = ?
+            """,
+            (user_id, device_id),
+        ).fetchone()
+        return dict(row)
+
+    def sync_state_for_user(self, user_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT devices.device_id, devices.name, devices.last_seen_at,
+                   sync_state.enabled, sync_state.last_synced_at, sync_state.last_error
+            FROM devices
+            JOIN sync_state
+              ON sync_state.user_id = devices.user_id
+             AND sync_state.device_id = devices.device_id
+            WHERE devices.user_id = ?
+            ORDER BY devices.last_seen_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def delete_session(self, session_id: int, user_id: int) -> bool:
         with self.connection:
@@ -1149,7 +1312,18 @@ class Database:
             raise
 
     def issue_user_token(self, user_id: int, lifetime_seconds: int = 86_400) -> str:
-        token = secrets.token_urlsafe(32)
+        now = time()
+        token = jwt.encode(
+            {
+                "sub": str(user_id),
+                "iat": int(now),
+                "exp": int(now + lifetime_seconds),
+                "iss": "focus_guard",
+                "jti": secrets.token_urlsafe(16),
+            },
+            self._JWT_SECRET,
+            algorithm="HS256",
+        )
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         self.connection.execute(
             "INSERT INTO user_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
@@ -1159,6 +1333,18 @@ class Database:
         return token
 
     def get_user_for_token(self, token: str) -> dict[str, Any] | None:
+        if token.count(".") == 2:
+            try:
+                claims = jwt.decode(
+                    token,
+                    self._JWT_SECRET,
+                    algorithms=["HS256"],
+                    issuer="focus_guard",
+                )
+                if int(claims["sub"]) <= 0:
+                    return None
+            except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+                return None
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         row = self.connection.execute(
             """

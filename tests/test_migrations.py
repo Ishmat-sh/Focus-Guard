@@ -31,7 +31,7 @@ def test_fresh_database_migrates_to_head_and_is_repeatable(tmp_path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        assert revision == "0004_analytics_precision"
+        assert revision == "0006_devices_sync_metadata"
         assert {
             "sessions",
             "telemetry",
