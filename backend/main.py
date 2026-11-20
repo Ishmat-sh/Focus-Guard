@@ -10,7 +10,7 @@ from pickle import UnpicklingError
 from threading import RLock
 from time import monotonic, time
 from typing import Any, Literal
-from collections import deque
+from collections import Counter, deque
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request, Response
@@ -240,8 +240,12 @@ def resume_session(user: dict[str, object] = Depends(require_ready_user)) -> dic
 
 @app.post("/sessions/end")
 def end_session(user: dict[str, object] = Depends(require_ready_user)) -> dict[str, object]:
-    user_id = int(user["id"])
+    return _end_session_for_user(int(user["id"]))
+
+
+def _end_session_for_user(user_id: int) -> dict[str, object]:
     result = _session_action(_session_manager_for(user_id).end, user_id)
+    summary = database.save_session_summary(user_id, int(result["id"]))
     if database.collection_is_consented(int(result["id"]), user_id):
         _persist_feature_windows(int(result["id"]), user_id)
     refresh_user_analytics(database, user_id)
@@ -259,13 +263,24 @@ def end_session(user: dict[str, object] = Depends(require_ready_user)) -> dict[s
     user_fatigue_estimators.pop(user_id, None)
     user_fatigue_snapshots.pop(user_id, None)
     _alert_manager_for(user_id).reset()
-    return result
+    return result | {"summary": summary}
 
 
 @app.get("/sessions/current")
 def current_session(user: dict[str, object] = Depends(require_ready_user)) -> dict[str, object]:
     session = _session_manager_for(int(user["id"])).snapshot()
     return asdict(session) | {"state": session.state.value} if session else {"state": "idle"}
+
+
+@app.get("/sessions/{session_id}/timeline")
+def session_timeline(
+    session_id: int,
+    user: dict[str, object] = Depends(require_ready_user),
+) -> list[dict[str, object]]:
+    user_id = int(user["id"])
+    if database.session_for_user(session_id, user_id) is None:
+        raise HTTPException(404, "Session not found")
+    return database.telemetry_for_session(user_id, session_id)
 
 
 @app.post("/attention/frame")
@@ -754,6 +769,18 @@ def analytics_heatmap(
     return build_heatmap(database, int(user["id"]), start, end)
 
 
+@app.get("/analytics/domains")
+def analytics_domains(
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    user: dict[str, object] = Depends(require_ready_user),
+) -> list[dict[str, object]]:
+    start, end = _analytics_date_range(start_date, end_date)
+    start_at = datetime.combine(start, datetime.min.time(), timezone.utc).timestamp()
+    end_at = datetime.combine(end + timedelta(days=1), datetime.min.time(), timezone.utc).timestamp()
+    return database.browser_domain_usage_for_user(int(user["id"]), start_at, end_at)
+
+
 @app.get("/analytics/streaks")
 def analytics_streaks(
     start_date: date | None = Query(default=None),
@@ -937,7 +964,35 @@ def metrics(user: dict[str, object] = Depends(require_ready_user)) -> dict[str, 
 
 @app.get("/history")
 def history(user: dict[str, object] = Depends(require_ready_user)) -> list[dict[str, object]]:
-    return database.user_history(int(user["id"]))
+    user_id = int(user["id"])
+    sessions = database.user_history(user_id)
+    enriched: list[dict[str, object]] = []
+    for session in sessions:
+        session_id = int(session["id"])
+        samples = database.telemetry_for_session(user_id, session_id)
+        summary = database.session_summary(user_id, session_id)
+        if summary is None and session["state"] == "completed":
+            summary = database.save_session_summary(user_id, session_id)
+        state_counts = Counter(str(sample["state"]) for sample in samples)
+        domain_counts = Counter(
+            str(sample["domain"]) for sample in samples if sample.get("domain")
+        )
+        enriched.append(
+            session
+            | {
+                "average_focus_score": (
+                    summary["average_focus_score"]
+                    if summary is not None
+                    else None
+                ),
+                "summary": summary,
+                "dominant_state": (
+                    state_counts.most_common(1)[0][0] if state_counts else None
+                ),
+                "top_domain": domain_counts.most_common(1)[0][0] if domain_counts else None,
+            }
+        )
+    return enriched
 
 
 @app.post("/users", status_code=201)
@@ -988,6 +1043,96 @@ def admin_login(payload: AdminLoginRequest) -> dict[str, object]:
     if not database.verify_admin(payload.username, payload.password):
         raise HTTPException(401, "Invalid admin credentials")
     return {"ok": True, "username": payload.username}
+
+
+@app.get("/admin/telemetry")
+def admin_telemetry(
+    credentials: HTTPBasicCredentials = Depends(admin_security),
+) -> dict[str, object]:
+    _require_admin(credentials)
+    user_summaries: list[dict[str, object]] = []
+    all_scores: list[float] = []
+    active_sessions = 0
+
+    for user in database.list_users():
+        user_id = int(user["id"])
+        samples = database.telemetry_for_user(user_id)
+        all_scores.extend(float(sample["score"]) for sample in samples)
+        state_counts = Counter(str(sample["state"]) for sample in samples)
+        transitions: list[dict[str, object]] = []
+        previous_state = None
+        for sample in samples[-200:]:
+            state = str(sample["state"])
+            if state != previous_state:
+                transitions.append(
+                    {
+                        "recorded_at": sample["recorded_at"],
+                        "elapsed_seconds": sample["elapsed_seconds"],
+                        "state": state,
+                        "score": sample["score"],
+                        "app_name": sample["app_name"],
+                        "app_category": sample["app_category"],
+                    }
+                )
+                previous_state = state
+
+        snapshot = _session_manager_for(user_id).snapshot()
+        active = snapshot is not None and snapshot.state.value in {"running", "paused"}
+        if active:
+            active_sessions += 1
+        current_session = (
+            asdict(snapshot) | {"state": snapshot.state.value}
+            if active and snapshot is not None
+            else None
+        )
+        current_domain = (
+            database.latest_browser_context(user_id, snapshot.id, time())
+            if snapshot is not None and snapshot.state.value == "running"
+            else None
+        )
+        user_summaries.append(
+            {
+                "id": user_id,
+                "name": user["name"],
+                "email": user["email"],
+                "created_at": user.get("created_at"),
+                "current_session": current_session,
+                "current_domain": current_domain,
+                "average_focus_score": (
+                    sum(float(sample["score"]) for sample in samples) / len(samples)
+                    if samples
+                    else None
+                ),
+                "dominant_state": state_counts.most_common(1)[0][0] if samples else None,
+                "last_active_at": samples[-1]["recorded_at"] if samples else None,
+                "recent_transitions": transitions[-20:],
+                "recent_domains": database.recent_browser_context_for_user(user_id),
+                "recent_sessions": database.user_history(user_id, limit=5),
+            }
+        )
+
+    return {
+        "summary": {
+            "registered_users": len(user_summaries),
+            "active_sessions": active_sessions,
+            "average_focus_score": (
+                sum(all_scores) / len(all_scores) if all_scores else None
+            ),
+        },
+        "users": user_summaries,
+    }
+
+
+@app.post("/admin/users/{user_id}/sessions/end")
+def admin_end_session(
+    user_id: int,
+    credentials: HTTPBasicCredentials = Depends(admin_security),
+) -> dict[str, object]:
+    _require_admin(credentials)
+    snapshot = _session_manager_for(user_id).snapshot()
+    if snapshot is None or snapshot.state.value not in {"running", "paused"}:
+        raise HTTPException(409, "User has no active session")
+    return _end_session_for_user(user_id)
 
 
 @app.post("/admin/users/{user_id}/password-reset")

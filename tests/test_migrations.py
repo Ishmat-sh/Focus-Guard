@@ -31,7 +31,7 @@ def test_fresh_database_migrates_to_head_and_is_repeatable(tmp_path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        assert revision == "0006_devices_sync_metadata"
+        assert revision == "0007_session_summaries"
         assert {
             "sessions",
             "telemetry",
@@ -43,6 +43,7 @@ def test_fresh_database_migrates_to_head_and_is_repeatable(tmp_path) -> None:
             "browser_context",
             "insights",
             "biometrics",
+            "session_summaries",
         } <= tables
     finally:
         connection.close()

@@ -20,7 +20,7 @@ from backend.features.schema import FEATURE_SCHEMA_VERSION, validate_feature_vec
 class Database:
     _PASSWORD_ITERATIONS = 310_000
     _JWT_SECRET = os.getenv("FOCUS_GUARD_JWT_SECRET") or secrets.token_hex(32)
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(self, path: str | Path = "focus_guard.db") -> None:
         requested_path = Path(path)
@@ -175,6 +175,19 @@ class Database:
                 distraction_count INTEGER NOT NULL,
                 session_count INTEGER NOT NULL,
                 PRIMARY KEY (user_id, summary_date)
+            );
+            CREATE TABLE IF NOT EXISTS session_summaries (
+                session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                observed_seconds REAL NOT NULL CHECK(observed_seconds >= 0),
+                focused_seconds REAL NOT NULL CHECK(focused_seconds >= 0),
+                distracted_seconds REAL NOT NULL CHECK(distracted_seconds >= 0),
+                drifting_seconds REAL NOT NULL CHECK(drifting_seconds >= 0),
+                fatigued_seconds REAL NOT NULL CHECK(fatigued_seconds >= 0),
+                focus_percentage REAL NOT NULL CHECK(focus_percentage BETWEEN 0 AND 100),
+                distraction_percentage REAL NOT NULL CHECK(distraction_percentage BETWEEN 0 AND 100),
+                average_focus_score REAL,
+                created_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS hourly_activity (
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -354,6 +367,145 @@ class Database:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def telemetry_for_session(self, user_id: int, session_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT telemetry.session_id, telemetry.recorded_at,
+                   telemetry.elapsed_seconds, telemetry.score, telemetry.state,
+                   telemetry.app_name, telemetry.app_category,
+                   (
+                       SELECT browser_context.domain
+                       FROM browser_context
+                       WHERE browser_context.user_id = sessions.user_id
+                         AND browser_context.session_id = telemetry.session_id
+                         AND browser_context.recorded_at <= telemetry.recorded_at
+                         AND browser_context.recorded_at >= telemetry.recorded_at - 30.0
+                       ORDER BY browser_context.recorded_at DESC, browser_context.id DESC
+                       LIMIT 1
+                   ) AS domain
+            FROM telemetry
+            JOIN sessions ON sessions.id = telemetry.session_id
+            WHERE sessions.user_id = ? AND telemetry.session_id = ?
+            ORDER BY telemetry.recorded_at, telemetry.id
+            """,
+            (user_id, session_id),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_session_summary(
+        self,
+        user_id: int,
+        session_id: int,
+    ) -> dict[str, Any] | None:
+        session = self.session_for_user(session_id, user_id)
+        if session is None:
+            return None
+
+        samples = self.telemetry_for_session(user_id, session_id)
+        durations = {
+            "focused": 0.0,
+            "distracted": 0.0,
+            "drifting": 0.0,
+            "fatigued": 0.0,
+        }
+        weighted_score = 0.0
+        observed_seconds = 0.0
+        session_elapsed = max(0.0, float(session["elapsed_seconds"] or 0.0))
+
+        for index, sample in enumerate(samples):
+            elapsed = sample["elapsed_seconds"]
+            if elapsed is None:
+                continue
+            elapsed = float(elapsed)
+            wall_start = float(sample["recorded_at"])
+            if index + 1 < len(samples):
+                following = samples[index + 1]
+                wall_gap = float(following["recorded_at"]) - wall_start
+                following_elapsed = following["elapsed_seconds"]
+                elapsed_gap = (
+                    float(following_elapsed) - elapsed
+                    if following_elapsed is not None
+                    else wall_gap
+                )
+            else:
+                wall_gap = (
+                    float(session["ended_at"]) - wall_start
+                    if session["ended_at"] is not None
+                    else 0.0
+                )
+                elapsed_gap = session_elapsed - elapsed
+
+            duration = min(max(0.0, wall_gap), max(0.0, elapsed_gap), 30.0)
+            if duration <= 0:
+                continue
+            state = str(sample["state"])
+            if state in durations:
+                durations[state] += duration
+            observed_seconds += duration
+            weighted_score += float(sample["score"]) * duration
+
+        focus_percentage = (
+            durations["focused"] / observed_seconds * 100.0
+            if observed_seconds
+            else 0.0
+        )
+        distraction_percentage = (
+            durations["distracted"] / observed_seconds * 100.0
+            if observed_seconds
+            else 0.0
+        )
+        average_score = weighted_score / observed_seconds if observed_seconds else None
+        self.connection.execute(
+            """
+            INSERT INTO session_summaries (
+                session_id, user_id, observed_seconds, focused_seconds,
+                distracted_seconds, drifting_seconds, fatigued_seconds,
+                focus_percentage, distraction_percentage, average_focus_score,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                user_id = excluded.user_id,
+                observed_seconds = excluded.observed_seconds,
+                focused_seconds = excluded.focused_seconds,
+                distracted_seconds = excluded.distracted_seconds,
+                drifting_seconds = excluded.drifting_seconds,
+                fatigued_seconds = excluded.fatigued_seconds,
+                focus_percentage = excluded.focus_percentage,
+                distraction_percentage = excluded.distraction_percentage,
+                average_focus_score = excluded.average_focus_score,
+                created_at = excluded.created_at
+            """,
+            (
+                session_id,
+                user_id,
+                observed_seconds,
+                durations["focused"],
+                durations["distracted"],
+                durations["drifting"],
+                durations["fatigued"],
+                focus_percentage,
+                distraction_percentage,
+                average_score,
+                time(),
+            ),
+        )
+        self.connection.commit()
+        return self.session_summary(user_id, session_id)
+
+    def session_summary(
+        self,
+        user_id: int,
+        session_id: int,
+    ) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT * FROM session_summaries
+            WHERE user_id = ? AND session_id = ?
+            """,
+            (user_id, session_id),
+        ).fetchone()
+        return dict(row) if row else None
+
     def upsert_category_rule(
         self, user_id: int, rule_type: str, rule_value: str, category: str
     ) -> dict[str, Any]:
@@ -475,6 +627,37 @@ class Database:
             (user_id, session_id, now - max_age_seconds),
         ).fetchone()
         return dict(row) if row else None
+
+    def browser_domain_usage_for_user(
+        self, user_id: int, start_at: float, end_at: float
+    ) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT domain, category, COUNT(*) AS sample_count,
+                   MAX(recorded_at) AS last_seen_at
+            FROM browser_context
+            WHERE user_id = ? AND recorded_at >= ? AND recorded_at < ?
+            GROUP BY domain, category
+            ORDER BY sample_count DESC, domain ASC
+            """,
+            (user_id, start_at, end_at),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recent_browser_context_for_user(
+        self, user_id: int, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT session_id, recorded_at, elapsed_seconds, domain, category
+            FROM browser_context
+            WHERE user_id = ?
+            ORDER BY recorded_at DESC, id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def replace_user_analytics(
         self,
@@ -911,10 +1094,15 @@ class Database:
                 data["features"] = json.loads(data.pop("features_json"))
                 windows.append(data)
             consented = self.collection_is_consented(session["id"], user_id)
+            summary_row = self.connection.execute(
+                "SELECT * FROM session_summaries WHERE session_id = ? AND user_id = ?",
+                (session["id"], user_id),
+            ).fetchone()
             exported_sessions.append(
                 dict(session)
                 | {
                     "collection_consented": consented,
+                    "summary": dict(summary_row) if summary_row else None,
                     "telemetry": telemetry,
                     "labels": [dict(row) for row in label_rows],
                     "feature_windows": windows,

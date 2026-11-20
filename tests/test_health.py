@@ -4,9 +4,10 @@ import cv2
 import numpy as np
 import pytest
 from uuid import uuid4
-from time import sleep
+from time import sleep, time
 
 import backend.main as main
+from backend.core.scoring import AttentionResult, AttentionState
 from backend.storage.database import Database
 from backend.vision.analyzer import VisionSnapshot
 
@@ -60,6 +61,69 @@ def test_health_check() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_session_timeline_is_authenticated_and_scoped_to_owner(isolate_api_database) -> None:
+    client = TestClient(app)
+    owner_headers = register_user(client, f"timeline-owner-{uuid4().hex}@example.com")
+    other_headers = register_user(client, f"timeline-other-{uuid4().hex}@example.com")
+    session_response = client.post("/sessions/start", headers=owner_headers)
+    session_id = session_response.json()["id"]
+    recorded_at = time()
+    result = AttentionResult(88.0, AttentionState.FOCUSED, 88.0, "Editor", "productive")
+    isolate_api_database.save_telemetry(
+        session_id,
+        recorded_at,
+        result,
+        True,
+        elapsed_seconds=1.0,
+    )
+    isolate_api_database.save_browser_context(
+        session_id,
+        "github.com",
+        recorded_at - 1,
+        0.0,
+    )
+
+    assert client.get(f"/sessions/{session_id}/timeline").status_code == 401
+    owner_response = client.get(
+        f"/sessions/{session_id}/timeline",
+        headers=owner_headers,
+    )
+    assert owner_response.status_code == 200
+    assert owner_response.json()[0]["domain"] == "github.com"
+    domain_usage = client.get("/analytics/domains", headers=owner_headers)
+    assert domain_usage.status_code == 200
+    assert domain_usage.json()[0]["domain"] == "github.com"
+    assert client.get(
+        f"/sessions/{session_id}/timeline",
+        headers=other_headers,
+    ).status_code == 404
+
+
+def test_admin_telemetry_reports_live_users_and_can_end_a_session(isolate_api_database) -> None:
+    client = TestClient(app)
+    username = f"telemetry-admin-{uuid4().hex}"
+    password = "admin-password-123"
+    isolate_api_database.create_admin(username, password)
+    headers = register_user(client, f"telemetry-user-{uuid4().hex}@example.com")
+    session_response = client.post("/sessions/start", headers=headers)
+    assert session_response.status_code == 200
+
+    assert client.get("/admin/telemetry").status_code == 401
+    assert client.post("/admin/users/1/sessions/end").status_code == 401
+    telemetry = client.get("/admin/telemetry", auth=(username, password))
+    assert telemetry.status_code == 200
+    user = telemetry.json()["users"][0]
+    assert telemetry.json()["summary"]["active_sessions"] == 1
+    assert user["current_session"]["state"] == "running"
+
+    ended = client.post(
+        f"/admin/users/{user['id']}/sessions/end",
+        auth=(username, password),
+    )
+    assert ended.status_code == 200
+    assert ended.json()["state"] == "completed"
 
 
 def test_cors_allows_frontend_from_lan_ip() -> None:
@@ -136,7 +200,7 @@ def test_focus_status_endpoint() -> None:
     assert response.json()["session_length_minutes"] == 25
 
 
-def test_session_lifecycle_and_attention_endpoints() -> None:
+def test_session_lifecycle_and_attention_endpoints(isolate_api_database) -> None:
     client = TestClient(app)
     headers = register_user(client, f"lifecycle-{uuid4().hex}@example.com")
     start = client.post("/sessions/start", headers=headers)
@@ -144,7 +208,17 @@ def test_session_lifecycle_and_attention_endpoints() -> None:
     assert start.json()["state"] == "running"
     assert client.post("/sessions/pause", headers=headers).json()["state"] == "paused"
     assert client.post("/sessions/resume", headers=headers).json()["state"] == "running"
-    assert client.post("/sessions/end", headers=headers).json()["state"] == "completed"
+    ended = client.post("/sessions/end", headers=headers)
+    assert ended.json()["state"] == "completed"
+    assert ended.json()["summary"]["observed_seconds"] == 0
+    persisted = isolate_api_database.connection.execute(
+        "SELECT session_id, focus_percentage, distraction_percentage "
+        "FROM session_summaries WHERE session_id = ?",
+        (start.json()["id"],),
+    ).fetchone()
+    assert persisted["session_id"] == start.json()["id"]
+    assert persisted["focus_percentage"] == 0
+    assert persisted["distraction_percentage"] == 0
     assert client.get("/history", headers=headers).status_code == 200
 
 

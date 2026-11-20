@@ -1,4 +1,5 @@
 import sqlite3
+import pytest
 
 from backend.analytics.service import refresh_user_analytics
 from backend.core.scoring import AttentionResult, AttentionState
@@ -35,6 +36,50 @@ def test_session_and_telemetry_are_persisted_without_raw_frames(tmp_path) -> Non
     assert "raw_frame" not in columns
 
 
+def test_session_summary_uses_time_weighted_states_and_persists(tmp_path) -> None:
+    database = Database(tmp_path / "session-summary.db")
+    user = database.create_user("Summary", "summary@example.com", "safe-password")
+    session = Session(
+        id=1,
+        state=SessionState.RUNNING,
+        started_at=100.0,
+    )
+    database.save_session(session, user["id"])
+    samples = [
+        (100.0, 0.0, 80.0, AttentionState.FOCUSED),
+        (110.0, 10.0, 30.0, AttentionState.DISTRACTED),
+        (120.0, 20.0, 90.0, AttentionState.FOCUSED),
+    ]
+    for recorded_at, elapsed, score, state in samples:
+        result = AttentionResult(score, state, score, "Editor", "productive")
+        database.save_telemetry(
+            session.id,
+            recorded_at,
+            result,
+            True,
+            elapsed_seconds=elapsed,
+        )
+    session.elapsed_seconds = 30.0
+    session.ended_at = 130.0
+    session.state = SessionState.COMPLETED
+    database.save_session(session, user["id"])
+
+    summary = database.save_session_summary(user["id"], session.id)
+
+    assert summary is not None
+    assert summary["observed_seconds"] == 30.0
+    assert summary["focused_seconds"] == 20.0
+    assert summary["distracted_seconds"] == 10.0
+    assert summary["focus_percentage"] == pytest.approx(200 / 3)
+    assert summary["distraction_percentage"] == pytest.approx(100 / 3)
+    assert summary["average_focus_score"] == pytest.approx(200 / 3)
+    stored = database.connection.execute(
+        "SELECT * FROM session_summaries WHERE session_id = ?",
+        (session.id,),
+    ).fetchone()
+    assert stored["focus_percentage"] == summary["focus_percentage"]
+
+
 def test_telemetry_requires_an_existing_session(tmp_path) -> None:
     database = Database(tmp_path / "focus_guard.db")
     result = AttentionResult(50.0, AttentionState.DRIFTING, 50.0, "Unknown", "unknown")
@@ -45,6 +90,23 @@ def test_telemetry_requires_an_existing_session(tmp_path) -> None:
         pass
     else:
         raise AssertionError("telemetry should require an existing session")
+
+
+def test_session_telemetry_includes_recent_domain_and_respects_user_scope(tmp_path) -> None:
+    database = Database(tmp_path / "focus_guard.db")
+    owner = database.create_user("Owner", "owner@example.com", "safe-password")
+    other = database.create_user("Other", "other@example.com", "safe-password")
+    session = Session(1, SessionState.RUNNING, 100.0)
+    database.save_session(session, owner["id"])
+    result = AttentionResult(82.0, AttentionState.FOCUSED, 82.0, "Code", "productive")
+    database.save_telemetry(1, 105.0, result, True, elapsed_seconds=5.0)
+    database.save_browser_context(1, "github.com", 104.0, 4.0)
+
+    owner_samples = database.telemetry_for_session(owner["id"], 1)
+
+    assert owner_samples[0]["domain"] == "github.com"
+    assert database.telemetry_for_session(other["id"], 1) == []
+    assert database.browser_domain_usage_for_user(owner["id"], 100.0, 110.0)[0]["domain"] == "github.com"
 
 
 def test_existing_sessions_table_gets_user_owner_column(tmp_path) -> None:
@@ -336,6 +398,7 @@ def test_database_explorer_lists_tables_and_redacts_sensitive_columns(tmp_path) 
         "model_versions",
         "user_privacy_settings",
         "daily_summaries",
+        "session_summaries",
         "hourly_activity",
         "focus_streaks",
         "app_usage",
