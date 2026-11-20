@@ -408,7 +408,6 @@ function App() {
     const [labels, setLabels] = useState([]);
     const [labelCount, setLabelCount] = useState(0);
     const [labelMessage, setLabelMessage] = useState("");
-    const [scorerStatus, setScorerStatus] = useState(null);
 
     const [error, setError] = useState("");
 
@@ -472,12 +471,10 @@ function App() {
 
     async function refresh() {
       try {
-        const [current, past, scorerResponse] = await Promise.all([
+        const [current, past] = await Promise.all([
           request("/sessions/current"),
           request("/history"),
-          request("/scorer"),
         ]);
-        setScorerStatus(scorerResponse);
         const live = current.state === "running" ? await requestAttention() : null;
 
         setSession(current);
@@ -669,18 +666,6 @@ function App() {
       }
     }
 
-    async function setScorerMode(mode) {
-      try {
-        await request("/scorer", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mode }),
-        });
-        await refresh();
-      } catch (requestError) {
-        setError(requestError.message || "Could not change scorer mode");
-      }
-    }
     // BACKEND SESSION TIME
 
     const elapsed =
@@ -711,7 +696,6 @@ function App() {
           </h2>
           <div className="navbar-actions">
             <button onClick={() => setPage("dashboard")}>Dashboard</button>
-            <button onClick={() => setPage("collection")}>Collection</button>
             <button onClick={() => setPage("analytics")}>Analytics</button>
             <button onClick={() => setPage("coaching")}>Coaching</button>
             <button onClick={() => setPage("settings")}>Settings</button>
@@ -789,30 +773,6 @@ function App() {
                 {hasAttention ? `${visionScore}%` : "—"}
               </p>
             </div>
-          </div>
-          <div className="status-card">
-            <h2>Attention Scorer</h2>
-            <p>
-              Active source: <strong>{attention.scorer || "rules"}</strong>
-              {attention.confidence != null
-                ? ` — confidence ${Math.round(attention.confidence * 100)}%`
-                : ""}
-            </p>
-            {scorerStatus?.model_version && (
-              <p>Model version: <strong>{scorerStatus.model_version}</strong></p>
-            )}
-            {attention.inference_ms != null && (
-              <p>Inference time: {Number(attention.inference_ms).toFixed(2)} ms</p>
-            )}
-            {attention.scorer_fallback_reason && (
-              <p className="error-banner">{attention.scorer_fallback_reason}</p>
-            )}
-            <button onClick={() => setScorerMode("ml")} disabled={attention.scorer === "ml"}>
-              Use ML
-            </button>
-            <button onClick={() => setScorerMode("rules")} disabled={attention.scorer === "rules"}>
-              Use Rules
-            </button>
           </div>
           {/* SESSION CONTROLS */}
           <div className="session-controls">
@@ -1038,7 +998,6 @@ function App() {
           <h2>Focus Guard</h2>
           <div className="navbar-actions">
             <button onClick={() => setPage("dashboard")}>Dashboard</button>
-            <button onClick={() => setPage("collection")}>Collection</button>
             <button onClick={() => setPage("analytics")}>Analytics</button>
             <button onClick={() => setPage("coaching")}>Coaching</button>
             <button onClick={() => setPage("settings")}>Settings</button>
@@ -1201,7 +1160,6 @@ function App() {
           <h2>Focus Guard</h2>
           <div className="navbar-actions">
             <button onClick={() => setPage("dashboard")}>Dashboard</button>
-            <button onClick={() => setPage("collection")}>Collection</button>
             <button onClick={() => setPage("analytics")}>Analytics</button>
             <button onClick={() => setPage("coaching")}>Coaching</button>
             <button onClick={() => setPage("settings")}>Settings</button>
@@ -1445,7 +1403,6 @@ function App() {
           <h2>Focus Guard</h2>
           <div className="navbar-actions">
             <button onClick={() => setPage("dashboard")}>Dashboard</button>
-            <button onClick={() => setPage("collection")}>Collection</button>
             <button onClick={() => setPage("analytics")}>Analytics</button>
             <button onClick={() => setPage("coaching")}>Coaching</button>
             <button onClick={() => setPage("settings")}>Settings</button>
@@ -1724,7 +1681,6 @@ function App() {
           <h2>Focus Guard</h2>
           <div className="navbar-actions">
             <button onClick={() => setPage("dashboard")}>Dashboard</button>
-            <button onClick={() => setPage("collection")}>Collection</button>
             <button onClick={() => setPage("analytics")}>Analytics</button>
             <button onClick={() => setPage("coaching")}>Coaching</button>
             <button onClick={() => setPage("settings")}>Settings</button>
