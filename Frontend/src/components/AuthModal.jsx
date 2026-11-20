@@ -134,6 +134,7 @@ export default function AuthModal({
             )}
             <label>
               Password
+              {/* Reuse the accessible reveal control for sign-in, sign-up, and admin login. */}
               <PasswordInput
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}

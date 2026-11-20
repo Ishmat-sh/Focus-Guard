@@ -30,6 +30,15 @@ export default function FocusCockpit({ attention, focusStreak = 0 }) {
           Current run{" "}
           <span className="tabular">{streakMinutes}:{String(streakSeconds).padStart(2, "0")}</span>
         </small>
+        {/* Give context on estimates without interrupting the live session UI. */}
+        <details className="metric-help">
+          <summary>How is focus estimated?</summary>
+          <p>
+            Focus Guard uses live facial-landmark signals and optional active-domain context.
+            Session percentages are weighted by observed time, not frame count; gaps over
+            30 seconds are excluded.
+          </p>
+        </details>
       </div>
     </section>
   );

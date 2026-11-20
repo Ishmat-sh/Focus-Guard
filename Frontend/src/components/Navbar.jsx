@@ -1,3 +1,5 @@
+import focusGuardLogo from "./focus_guard_logo (1).svg";
+
 export default function Navbar({
   page,
   setPage,
@@ -18,9 +20,9 @@ export default function Navbar({
           setPage("home");
         }}
       >
-        <span className="brand-mark" aria-hidden="true">F</span>
+        {/* Use the supplied Focus Guard mark in the shared application header. */}
+        <img className="brand-logo" src={focusGuardLogo} alt="" aria-hidden="true" />
         <span>Focus Guard</span>
-        <span className="status-dot" aria-label="Privacy-first focus tools" />
       </a>
       <nav className="navbar-actions" aria-label="Main navigation">
         {isAdmin ? (

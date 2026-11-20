@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Focus Guard FG Monogram Logo">
+  <defs>
+    <mask id="f-cutout">
+      <rect width="512" height="512" fill="#ffffff" />
+      <circle cx="302" cy="256" r="118" fill="#000000" />
+    </mask>
+  </defs>
+
+  <!-- Pure white background -->
+  <rect width="512" height="512" fill="#FFFFFF" />
+
+  <!-- Letter F (masked around the G curve for a concentric negative-space gap) -->
+  <g mask="url(#f-cutout)" fill="#000000">
+    <rect x="122" y="148" width="44" height="216" />
+    <rect x="122" y="148" width="150" height="42" />
+    <rect x="122" y="235" width="90" height="40" />
+  </g>
+
+  <!-- Letter G outer arc -->
+  <path
+    d="M 382.26 183.73
+       A 108 108 0 1 0 408.32 275.00
+       L 366.97 267.61
+       A 66 66 0 1 1 351.05 211.83
+       Z"
+    fill="#000000"
+  />
+
+  <!-- Emerald geometric crossbar on G -->
+  <polygon points="316,235 408.32,235 408.32,275 276,275" fill="#10B981" />
+</svg>

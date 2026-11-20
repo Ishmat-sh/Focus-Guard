@@ -170,16 +170,14 @@ small {
   white-space: nowrap;
 }
 
-.brand-mark {
-  display: grid;
-  width: 1.8rem;
-  height: 1.8rem;
-  place-items: center;
-  border: 1px solid #d7e2d8;
+/* Keep the supplied brand artwork legible in the compact navigation bar. */
+.brand-logo {
+  display: block;
+  width: 2rem;
+  height: 2rem;
   border-radius: 0.6rem;
-  background: #edf3ee;
-  color: #42644f;
-  font-size: 0.85rem;
+  object-fit: cover;
+  flex: none;
 }
 
 .status-dot {
@@ -491,6 +489,130 @@ small {
   box-shadow: 0 18px 48px rgb(36 39 32 / 18%);
 }
 
+/* Keep session-end confirmation in the app's visual language instead of a browser prompt. */
+.end-session-backdrop {
+  position: fixed;
+  z-index: 60;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgb(36 39 32 / 42%);
+  backdrop-filter: blur(4px);
+}
+
+.end-session-dialog {
+  width: min(440px, 100%);
+  padding: clamp(1.35rem, 4vw, 2rem);
+  border: 1px solid var(--border);
+  border-radius: 0.9rem;
+  background: #ffffff;
+  box-shadow: 0 18px 48px rgb(36 39 32 / 18%);
+}
+
+.end-session-mark {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  margin-bottom: 1.15rem;
+  border: 1px solid #dfcfad;
+  border-radius: 0.7rem;
+  background: #f6f1e7;
+  color: #8d6a33;
+}
+
+.end-session-mark svg {
+  width: 22px;
+  height: 22px;
+}
+
+.end-session-dialog h2 {
+  margin-bottom: 0.6rem;
+  font-size: 1.5rem;
+}
+
+.end-session-dialog > p:not(.eyebrow) {
+  line-height: 1.6;
+}
+
+.end-session-saving {
+  padding: 0.75rem;
+  border-radius: 0.55rem;
+  background: #f5f4f0;
+  font-size: 0.82rem;
+}
+
+.end-session-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin-top: 1.5rem;
+}
+
+/* Match account-data deletion confirmation to the app's styled session dialog. */
+.settings-delete-backdrop {
+  position: fixed;
+  z-index: 70;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgb(36 39 32 / 42%);
+  backdrop-filter: blur(4px);
+}
+
+.settings-delete-dialog {
+  width: min(440px, 100%);
+  padding: clamp(1.35rem, 4vw, 2rem);
+  border: 1px solid var(--border);
+  border-radius: 0.9rem;
+  background: #ffffff;
+  box-shadow: 0 18px 48px rgb(36 39 32 / 18%);
+}
+
+.settings-delete-dialog h2 {
+  margin-bottom: 0.6rem;
+  font-size: 1.5rem;
+}
+
+.settings-delete-dialog > p:not(.eyebrow) {
+  line-height: 1.6;
+}
+
+.settings-delete-icon {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  margin-bottom: 1.15rem;
+  border: 1px solid #ecddda;
+  border-radius: 0.7rem;
+  background: #fbf3f1;
+  color: #a9514b;
+}
+
+.settings-delete-icon svg {
+  width: 22px;
+  height: 22px;
+}
+
+.settings-delete-progress {
+  padding: 0.75rem;
+  border-radius: 0.55rem;
+  background: #f5f4f0;
+  font-size: 0.82rem;
+}
+
+.settings-delete-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin-top: 1.5rem;
+}
+
 .auth-header {
   display: flex;
   align-items: flex-start;
@@ -657,7 +779,7 @@ small {
 
 .camera-pip {
   position: fixed;
-  z-index: 10;
+  z-index: 30;
   right: 1.25rem;
   bottom: 1.25rem;
   width: min(230px, calc(100vw - 2rem));
@@ -676,17 +798,35 @@ small {
   transform: scaleX(-1);
 }
 
+/* Keep the media element mounted while minimized so sampling can keep reading frames. */
+.camera-pip video.camera-video-hidden {
+  display: none;
+}
+
 .camera-pip.minimized {
   width: auto;
   border-radius: 999px;
 }
 
+/* The preview header is the drag handle; touch and keyboard movement are supported. */
 .camera-pip-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.6rem;
   padding: 0.5rem 0.65rem;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.camera-pip-header:active {
+  cursor: grabbing;
+}
+
+.camera-pip-header:focus-visible {
+  outline: 2px solid #587b63;
+  outline-offset: -3px;
 }
 
 .camera-pip-header button {
@@ -843,6 +983,121 @@ small {
   width: min(1120px, calc(100% - 2rem));
   margin: 0 auto;
   padding: 2.5rem 0 4rem;
+}
+
+/* Keep Settings intentionally limited to export and account-data deletion. */
+.settings-header {
+  max-width: 680px;
+  margin-bottom: 2rem;
+}
+
+.settings-header h1 {
+  margin-bottom: 0.6rem;
+  font-size: clamp(2.2rem, 5vw, 3.2rem);
+  font-weight: 550;
+  letter-spacing: -0.065em;
+}
+
+.settings-header > p:last-child {
+  line-height: 1.6;
+}
+
+.settings-session-data {
+  max-width: 900px;
+  margin-bottom: 1rem;
+}
+
+.settings-session-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.8rem;
+}
+
+.settings-session-header .eyebrow {
+  margin-bottom: 0.45rem;
+}
+
+.settings-session-header h2 {
+  margin-bottom: 0;
+  font-size: 1.2rem;
+}
+
+.settings-session-data .data-table {
+  min-width: 650px;
+}
+
+.settings-load-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.settings-load-error p {
+  margin-bottom: 0;
+}
+
+.settings-data-grid {
+  display: grid;
+  max-width: 900px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.settings-data-card {
+  display: flex;
+  min-height: 290px;
+  flex-direction: column;
+  align-items: flex-start;
+  padding: clamp(1.25rem, 4vw, 2rem);
+}
+
+.settings-data-card .eyebrow {
+  margin: 1.3rem 0 0.55rem;
+}
+
+.settings-data-card h2 {
+  margin-bottom: 0.5rem;
+  font-size: 1.45rem;
+}
+
+.settings-data-card > p:not(.eyebrow) {
+  max-width: 34ch;
+  line-height: 1.6;
+}
+
+.settings-data-card > button {
+  margin-top: auto;
+}
+
+.settings-delete-card {
+  border-color: #ecddda;
+  background: #fdfaf9;
+}
+
+.settings-action-icon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 0.7rem;
+  background: #ffffff;
+  color: #587b63;
+}
+
+.settings-action-icon svg {
+  width: 20px;
+  height: 20px;
+}
+
+.settings-action-icon.delete-icon {
+  border-color: #ecddda;
+  background: #fbf3f1;
+  color: #a9514b;
 }
 
 .page {
@@ -1012,20 +1267,51 @@ small {
 }
 
 @media (max-width: 600px) {
+  /* Keep the brand and navigation on one compact, horizontally scrollable row. */
   .navbar {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 0.55rem;
-    padding: 0.65rem 1rem;
+    align-items: center;
+    flex-direction: row;
+    gap: 0.4rem;
+    padding: 0.45rem 0.65rem;
+  }
+
+  .brand {
+    gap: 0.4rem;
+    font-size: 0.78rem;
+  }
+
+  .brand-logo {
+    width: 1.7rem;
+    height: 1.7rem;
   }
 
   .navbar-actions {
-    width: 100%;
+    width: auto;
+    max-width: calc(100vw - 150px);
+    flex-wrap: nowrap;
     justify-content: flex-start;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+  }
+
+  .navbar-actions::-webkit-scrollbar {
+    display: none;
   }
 
   .navbar-actions button {
     padding-inline: 0.55rem;
+    flex: none;
+    font-size: 0.72rem;
+    white-space: nowrap;
+  }
+
+  .navbar-actions .badge {
+    max-width: 90px;
+    flex: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .page-wrap,
@@ -1215,6 +1501,30 @@ small {
   text-transform: capitalize;
 }
 
+/* Let users inspect how the live signal and saved session averages are derived. */
+.metric-help {
+  margin-top: 1rem;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+}
+
+.metric-help summary {
+  width: fit-content;
+  color: #587b63;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.metric-help p {
+  max-width: 58ch;
+  margin: 0.65rem 0 0;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  background: #f7f6f2;
+  line-height: 1.55;
+}
+
 .focus-score-track {
   height: 6px;
   margin-bottom: 0.9rem;
@@ -1375,6 +1685,10 @@ h3 {
 
 @media (max-width: 700px) {
   .summary-stats {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-data-grid {
     grid-template-columns: 1fr;
   }
 

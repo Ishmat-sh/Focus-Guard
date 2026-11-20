@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { apiRequest } from "../services/api.js";
 import PasswordInput from "./PasswordInput.jsx";
 
@@ -428,234 +428,242 @@ export function CollectionView({ apiFetch, onBack }) {
 }
 
 export function SettingsView({ apiFetch }) {
-  const [retention, setRetention] = useState("");
-  const [rules, setRules] = useState([]);
-  const [history, setHistory] = useState([]);
-  const [browserContext, setBrowserContext] = useState(null);
-  const [biometrics, setBiometrics] = useState([]);
-  const [syncState, setSyncState] = useState([]);
-  const [ruleType, setRuleType] = useState("domain");
-  const [ruleValue, setRuleValue] = useState("");
-  const [ruleCategory, setRuleCategory] = useState("productive");
-  const [lightingEndpoint, setLightingEndpoint] = useState("");
+  const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
+  const [sessions, setSessions] = useState([]);
+  const [loadingSessions, setLoadingSessions] = useState(true);
+  const [sessionError, setSessionError] = useState("");
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
 
-  async function load() {
+  const loadSessions = useCallback(async (signal) => {
+    setLoadingSessions(true);
+    setSessionError("");
     try {
-      const [retentionData, categoryRules, sessions, context, biometricsData, sync] = await Promise.all([
-        apiRequest(apiFetch, "/privacy/retention"),
-        apiRequest(apiFetch, "/context/category-rules"),
-        apiRequest(apiFetch, "/history"),
-        apiRequest(apiFetch, "/context/browser"),
-        apiRequest(apiFetch, "/biometrics"),
-        apiRequest(apiFetch, "/sync"),
-      ]);
-      setRetention(retentionData?.retention_days == null ? "" : String(retentionData.retention_days));
-      setRules(categoryRules || []);
-      setHistory(sessions || []);
-      setBrowserContext(context);
-      setBiometrics(biometricsData || []);
-      setSyncState(sync || []);
+      const result = await apiRequest(
+        apiFetch,
+        "/history",
+        signal ? { signal } : undefined,
+      );
+      if (!Array.isArray(result)) throw new Error("Session data returned an unexpected format.");
+      if (!signal?.aborted) setSessions(result);
     } catch (loadError) {
-      setMessage(loadError.message || "Could not load settings.");
+      if (!signal?.aborted) {
+        setSessionError(loadError.message || "Could not load session data.");
+      }
+    } finally {
+      if (!signal?.aborted) setLoadingSessions(false);
     }
-  }
-
-  useEffect(() => {
-    load();
   }, [apiFetch]);
 
-  async function saveRetention() {
-    try {
-      const result = await apiRequest(apiFetch, "/privacy/retention", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ retention_days: retention === "" ? null : Number(retention) }),
-      });
-      setMessage(result.retention_days == null
-        ? "Retention disabled."
-        : `Retention set to ${result.retention_days} days.`);
-    } catch (saveError) {
-      setMessage(saveError.message || "Could not save retention.");
-    }
-  }
-
-  async function saveRule(event) {
-    event.preventDefault();
-    try {
-      const result = await apiRequest(apiFetch, "/context/category-rules", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          rule_type: ruleType,
-          rule_value: ruleValue.trim(),
-          category: ruleCategory,
-        }),
-      });
-      setRuleValue("");
-      setMessage(`Saved category rule for ${result.rule_value}.`);
-      await load();
-    } catch (ruleError) {
-      setMessage(ruleError.message || "Could not save category rule.");
-    }
-  }
-
-  async function deleteRule(ruleId) {
-    try {
-      await apiRequest(apiFetch, `/context/category-rules/${ruleId}`, { method: "DELETE" });
-      await load();
-    } catch (deleteError) {
-      setMessage(deleteError.message || "Could not delete category rule.");
-    }
-  }
+  useEffect(() => {
+    const controller = new AbortController();
+    loadSessions(controller.signal);
+    return () => controller.abort();
+  }, [loadSessions]);
 
   async function exportData() {
+    setBusy("export");
+    setMessage("");
     try {
       const response = await apiFetch("/data/export.json");
       if (!response.ok) throw new Error("Could not export account data.");
       downloadBlob(await response.blob(), "focus-guard-export.json");
+      setMessage("Your data export has been downloaded.");
     } catch (exportError) {
       setMessage(exportError.message || "Could not export data.");
+    } finally {
+      setBusy("");
     }
   }
 
   async function deleteAllData() {
-    if (!window.confirm("Delete all Focus Guard sessions and derived data from this account?")) return;
+    setBusy("delete");
+    setMessage("");
     try {
-      await apiRequest(apiFetch, "/data", { method: "DELETE" });
-      setMessage("Deleted all account data.");
-      await load();
+      const result = await apiRequest(apiFetch, "/data", { method: "DELETE" });
+      const count = result.deleted_sessions || 0;
+      setSessions([]);
+      setSessionError("");
+      setConfirmingDelete(false);
+      setMessage(`Deleted session and derived data. ${count} session${count === 1 ? "" : "s"} removed.`);
     } catch (deleteError) {
       setMessage(deleteError.message || "Could not delete account data.");
+      setConfirmingDelete(false);
+    } finally {
+      setBusy("");
     }
   }
 
-  async function configureSync(enabled) {
-    let deviceId = window.localStorage.getItem("focus_guard_device_id");
-    if (!deviceId) {
-      deviceId = crypto.randomUUID();
-      window.localStorage.setItem("focus_guard_device_id", deviceId);
-    }
-    try {
-      await apiRequest(apiFetch, "/sync", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ device_id: deviceId, device_name: navigator.platform || "Browser", enabled }),
-      });
-      setMessage(enabled
-        ? "Derived-data sync is enabled. Raw frames and URLs are excluded."
-        : "Sync disabled.");
-      await load();
-    } catch (syncError) {
-      setMessage(syncError.message || "Could not update sync.");
-    }
-  }
-
-  async function setLightingState(state) {
-    if (!lightingEndpoint.trim()) {
-      setMessage("Enter a smart-lighting HTTP endpoint first.");
+  function handleDeleteDialogKeyDown(event) {
+    if (event.key === "Escape" && !busy) {
+      setConfirmingDelete(false);
       return;
     }
-    try {
-      await apiRequest(apiFetch, "/lighting", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ endpoint: lightingEndpoint.trim(), state }),
-      });
-      setMessage(`Lighting set to ${state}.`);
-    } catch (lightingError) {
-      setMessage(lightingError.message || "Lighting API unavailable.");
-    }
-  }
-
-  async function deleteSession(sessionId) {
-    if (!window.confirm(`Delete session ${sessionId} and all of its data?`)) return;
-    try {
-      await apiRequest(apiFetch, `/sessions/${sessionId}`, { method: "DELETE" });
-      setMessage(`Deleted session ${sessionId}.`);
-      await load();
-    } catch (deleteError) {
-      setMessage(deleteError.message || "Could not delete session.");
+    if (event.key !== "Tab") return;
+    const buttons = event.currentTarget.querySelectorAll("button:not(:disabled)");
+    const firstButton = buttons[0];
+    const lastButton = buttons[buttons.length - 1];
+    if (event.shiftKey && document.activeElement === firstButton) {
+      event.preventDefault();
+      lastButton?.focus();
+    } else if (!event.shiftKey && document.activeElement === lastButton) {
+      event.preventDefault();
+      firstButton?.focus();
     }
   }
 
   return (
-    <main className="feature-page">
-      <p className="eyebrow">Your data, your choices</p>
-      <h1>Settings and privacy</h1>
+    <main className="feature-page settings-page">
+      <header className="settings-header">
+        <p className="eyebrow">Your data, your choice</p>
+        <h1>Settings</h1>
+        <p className="muted">Export a copy of your data or permanently delete your session data.</p>
+      </header>
       {message && <p className="status-message" role="status">{message}</p>}
-      <section className="panel">
-        <h2>What is stored</h2>
-        <p>Numerical scores and derived features are stored. Raw frames, recordings, full URLs, and page titles are never stored.</p>
-      </section>
-      <section className="panel" style={{ marginTop: "1rem" }}>
-        <h2>Browser extension</h2>
-        <p>{browserContext
-          ? `Last reported ${browserContext.domain} · ${browserContext.category}.`
-          : "No active domain is being reported for a running session."}</p>
-      </section>
-      <section className="panel" style={{ marginTop: "1rem" }}>
-        <h2>Context category rules</h2>
-        <form className="rule-form" onSubmit={saveRule}>
-          <select value={ruleType} onChange={(event) => setRuleType(event.target.value)}>
-            <option value="domain">Domain</option><option value="app">Application</option>
-          </select>
-          <input value={ruleValue} onChange={(event) => setRuleValue(event.target.value)} placeholder={ruleType === "domain" ? "example.com" : "App name"} required />
-          <select value={ruleCategory} onChange={(event) => setRuleCategory(event.target.value)}>
-            <option value="productive">Productive</option><option value="neutral">Neutral</option><option value="distracting">Distracting</option>
-          </select>
-          <button type="submit">Save rule</button>
-        </form>
-        {rules.map((rule) => (
-          <div className="daily-row" key={rule.id}>
-            <strong>{rule.rule_type}: {rule.rule_value}</strong><span>{rule.category}</span>
-            <button className="button-quiet" onClick={() => deleteRule(rule.id)}>Delete</button>
+      {/* Keep account settings focused on the two data actions requested. */}
+      {/* Show session averages only; detailed telemetry remains available through export. */}
+      <section className="panel settings-session-data">
+        <div className="settings-session-header">
+          <div>
+            <p className="eyebrow">Your stored data</p>
+            <h2>Recent sessions</h2>
           </div>
-        ))}
-        {!rules.length && <p className="muted">No custom category rules.</p>}
-      </section>
-      <div className="dashboard-grid" style={{ marginTop: "1rem" }}>
-        <section className="panel">
-          <h2>Retention</h2>
-          <label>
-            Retain telemetry for (days)
-            <input type="number" min="1" max="3650" value={retention} onChange={(event) => setRetention(event.target.value)} placeholder="No automatic deletion" />
-          </label>
-          <button style={{ marginTop: "0.75rem" }} onClick={saveRetention}>Save retention</button>
-        </section>
-        <section className="panel">
-          <h2>Cloud sync</h2>
-          <p>Sync is opt-in and exports derived data only.</p>
-          {syncState.map((item) => <p key={item.device_id}>{item.name || item.device_id}: {item.enabled ? "Enabled" : "Disabled"}</p>)}
-          <button onClick={() => configureSync(true)}>Enable</button>
-          <button className="button-secondary" onClick={() => configureSync(false)}>Disable</button>
-        </section>
-        <section className="panel">
-          <h2>Smart lighting</h2>
-          <input value={lightingEndpoint} onChange={(event) => setLightingEndpoint(event.target.value)} placeholder="HTTP endpoint" />
-          <div className="session-controls">
-            {["focused", "break", "idle"].map((state) => <button className="button-secondary" key={state} onClick={() => setLightingState(state)}>{state}</button>)}
+          {!loadingSessions && <span className="badge">{sessions.length} shown</span>}
+        </div>
+        {loadingSessions ? (
+          <p className="loading">Loading session data…</p>
+        ) : sessionError ? (
+          <div className="settings-load-error" role="alert">
+            <p>{sessionError}</p>
+            <button className="button-secondary" onClick={() => loadSessions()} disabled={loadingSessions}>
+              Try again
+            </button>
           </div>
+        ) : sessions.length ? (
+          <div className="table-scroll">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Duration</th>
+                  <th>Avg score</th>
+                  <th>Focused</th>
+                  <th>Distracted</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sessions.map((session) => {
+                  const summary = session.summary;
+                  const hasObservedData = Number(summary?.observed_seconds) > 0;
+                  const duration = Math.max(0, Math.floor(Number(session.elapsed_seconds) || 0));
+                  return (
+                    <tr key={session.id}>
+                      <td>
+                        {session.started_at
+                          ? new Date(Number(session.started_at) * 1000).toLocaleString()
+                          : "—"}
+                      </td>
+                      <td className="tabular">{Math.floor(duration / 60)}m {String(duration % 60).padStart(2, "0")}s</td>
+                      <td className="tabular">
+                        {summary?.average_focus_score == null
+                          ? "—"
+                          : `${Math.round(summary.average_focus_score)}%`}
+                      </td>
+                      <td className="tabular">
+                        {hasObservedData ? `${Math.round(summary.focus_percentage)}%` : "—"}
+                      </td>
+                      <td className="tabular">
+                        {hasObservedData ? `${Math.round(summary.distraction_percentage)}%` : "—"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="empty">No sessions have been recorded yet.</p>
+        )}
+      </section>
+      <div className="settings-data-grid">
+        <section className="panel settings-data-card">
+          <div className="settings-action-icon export-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 3v12m0 0 4-4m-4 4-4-4" />
+              <path d="M5 15v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4" />
+            </svg>
+          </div>
+          <p className="eyebrow">Take your data with you</p>
+          <h2>Export data</h2>
+          <p className="muted">Download your sessions, summaries, and related account data as a JSON file.</p>
+          <button className="button-secondary" onClick={exportData} disabled={Boolean(busy)}>
+            {busy === "export" ? "Preparing export…" : "Export all data"}
+          </button>
         </section>
-        <section className="panel">
-          <h2>Wearable biometrics</h2>
-          {biometrics.length ? (
-            <p>Latest heart rate: {Math.round(biometrics[0].heart_rate)} bpm · {biometrics[0].source_device}</p>
-          ) : <p>No biometric samples recorded.</p>}
-        </section>
-        <section className="panel">
-          <h2>Export and delete</h2>
-          <button className="button-secondary" onClick={exportData}>Export all data</button>
-          <button className="button-danger" onClick={deleteAllData}>Delete all data</button>
-          {history.map((session) => (
-            <div className="daily-row" key={session.id}>
-              <strong>Session #{session.id}</strong>
-              <span>{Math.round(session.elapsed_seconds || 0)}s</span>
-              <button className="button-quiet" onClick={() => deleteSession(session.id)}>Delete</button>
-            </div>
-          ))}
+        <section className="panel settings-data-card settings-delete-card">
+          <div className="settings-action-icon delete-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M4 7h16m-10 4v6m4-6v6M6 7l1 14h10l1-14M9 7V4h6v3" />
+            </svg>
+          </div>
+          <p className="eyebrow">Permanent action</p>
+          <h2>Delete data</h2>
+          <p className="muted">Permanently remove your sessions and derived data. Your account will remain active.</p>
+          <button
+            className="button-danger"
+            onClick={() => setConfirmingDelete(true)}
+            disabled={Boolean(busy)}
+          >
+            {busy === "delete" ? "Deleting data…" : "Delete all data"}
+          </button>
         </section>
       </div>
+      {confirmingDelete && (
+        <div
+          className="settings-delete-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !busy) {
+              setConfirmingDelete(false);
+            }
+          }}
+        >
+          <section
+            className="settings-delete-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="settings-delete-title"
+            aria-describedby="settings-delete-description"
+            onKeyDown={handleDeleteDialogKeyDown}
+          >
+            <div className="settings-delete-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M4 7h16m-10 4v6m4-6v6M6 7l1 14h10l1-14M9 7V4h6v3" />
+              </svg>
+            </div>
+            <p className="eyebrow">Permanent action</p>
+            <h2 id="settings-delete-title">Delete your session data?</h2>
+            <p id="settings-delete-description">
+              This removes your sessions, summaries, and derived data. Your account and sign-in will remain active.
+            </p>
+            {busy === "delete" && (
+              <p className="settings-delete-progress" role="status">Deleting your data…</p>
+            )}
+            <div className="settings-delete-actions">
+              <button
+                className="button-secondary"
+                autoFocus
+                onClick={() => setConfirmingDelete(false)}
+                disabled={Boolean(busy)}
+              >
+                Keep my data
+              </button>
+              <button className="button-danger" onClick={deleteAllData} disabled={Boolean(busy)}>
+                {busy === "delete" ? "Deleting…" : "Delete data"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }

@@ -8,6 +8,7 @@ const STATES = [
 
 export default function HomeView({ onOpenAuth, onStart }) {
   const [previewState, setPreviewState] = useState(STATES[0]);
+  // These illustrative percentages let visitors preview how session averages are presented.
   const focused = previewState.name === "focused" ? 62 : previewState.name === "drifting" ? 38 : 20;
   const distracted = previewState.name === "distracted" ? 52 : previewState.name === "drifting" ? 30 : 14;
   const other = 100 - focused - distracted;
